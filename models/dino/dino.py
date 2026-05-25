@@ -44,6 +44,36 @@ from ..registry import MODULE_BUILD_FUNCS
 from .dn_components import prepare_for_cdn, dn_post_process
 
 
+def apply_activation_gating(
+    logits,
+    activation_logits,
+    use_activation_gating=False,
+    activation_gate_blank_coef=0.0,
+    activation_gate_nonblank_coef=0.0,
+):
+    if not use_activation_gating or activation_logits is None:
+        return logits
+    activation = torch.sigmoid(activation_logits)
+    gated = logits.clone()
+    gated[:, :, :1] = gated[:, :, :1] + (1.0 - activation) * activation_gate_blank_coef
+    gated[:, :, 1:] = gated[:, :, 1:] + activation * activation_gate_nonblank_coef
+    return gated
+
+
+def compute_query_count_loss(activation_logits, target_lengths, short_weight=1.0):
+    activation = torch.sigmoid(activation_logits)
+    if activation.dim() == 3 and activation.shape[-1] == 1:
+        activation = activation.squeeze(-1)
+    expected_count = activation.sum(-1)
+    target_lengths = target_lengths.to(expected_count.device).float()
+    loss = F.smooth_l1_loss(expected_count, target_lengths, reduction="none")
+    if short_weight > 1.0:
+        weights = torch.ones_like(loss)
+        weights[target_lengths <= 2.0] = short_weight
+        loss = loss * weights
+    return loss.mean(), expected_count
+
+
 class DINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
 
@@ -74,6 +104,7 @@ class DINO(nn.Module):
         dn_label_noise_ratio=0.5,
         dn_labelbook_size=100,
         use_direction_head=False,
+        use_query_activation_head=False,
     ):
         """Initializes the model.
         Parameters:
@@ -97,6 +128,7 @@ class DINO(nn.Module):
         self.nheads = nheads
         self.label_enc = nn.Embedding(dn_labelbook_size + 1, hidden_dim)
         self.use_direction_head = use_direction_head
+        self.use_query_activation_head = use_query_activation_head
 
         # setting query dim
         self.query_dim = query_dim
@@ -228,6 +260,8 @@ class DINO(nn.Module):
         self._reset_parameters()
         if self.use_direction_head:
             self.direction_embed = nn.Linear(hidden_dim, 2)
+        if self.use_query_activation_head:
+            self.query_activation_embed = nn.Linear(hidden_dim, 1)
 
     def _reset_parameters(self):
         # init input_proj
@@ -362,6 +396,8 @@ class DINO(nn.Module):
                 self._set_aux_loss,
             )
         out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        if self.use_query_activation_head:
+            out["pred_activation_logits"] = self.query_activation_embed(hs[-1])
         if self.use_direction_head:
             out["pred_direction"] = self.direction_embed(hs[-1].mean(dim=1))
         if self.aux_loss:
@@ -449,6 +485,12 @@ class SetCriterion(nn.Module):
         short_gt_presence_margin=0.0,
         short_gt_ce_max_len=0,
         short_gt_ce_gamma=0.0,
+        use_query_activation_head=False,
+        use_query_count_loss=False,
+        use_activation_gating=False,
+        activation_gate_blank_coef=0.0,
+        activation_gate_nonblank_coef=0.0,
+        query_count_short_weight=1.0,
     ):
         """Create the criterion.
         Parameters:
@@ -471,10 +513,19 @@ class SetCriterion(nn.Module):
         self.short_gt_presence_margin = float(short_gt_presence_margin)
         self.short_gt_ce_max_len = int(short_gt_ce_max_len)
         self.short_gt_ce_gamma = float(short_gt_ce_gamma)
+        self.use_query_activation_head = bool(use_query_activation_head)
+        self.use_query_count_loss = bool(use_query_count_loss)
+        self.use_activation_gating = bool(use_activation_gating)
+        self.activation_gate_blank_coef = float(activation_gate_blank_coef)
+        self.activation_gate_nonblank_coef = float(activation_gate_nonblank_coef)
+        self.query_count_short_weight = float(query_count_short_weight)
         self.direction_loss_enabled = "loss_direction" in self.weight_dict
         self.ctc_count_loss_enabled = "loss_ctc_count" in self.weight_dict
         self.short_gt_presence_enabled = "loss_short_gt_presence" in self.weight_dict
         self.short_gt_ce_enabled = "loss_short_gt_ce" in self.weight_dict
+        self.query_count_loss_enabled = (
+            self.use_query_count_loss and "loss_query_count" in self.weight_dict
+        )
         if self.CTC:
             self.losses_all = copy.deepcopy(self.losses)
             self.losses_CTC = ["loss_CTC"]
@@ -593,6 +644,22 @@ class SetCriterion(nn.Module):
                     * scale[over_mask].unsqueeze(-1)
                 )
                 new_pred_logits[:, :, 0][over_mask] = self.ctc_blank_max
+
+        activation_logits = outputs.get("pred_activation_logits")
+        if self.use_activation_gating and activation_logits is not None:
+            sorted_activation_logits = torch.gather(
+                activation_logits,
+                1,
+                idx.unsqueeze(-1),
+            )
+            gated_log_probs = apply_activation_gating(
+                torch.log(new_pred_logits.clamp(min=1e-8)),
+                sorted_activation_logits,
+                use_activation_gating=True,
+                activation_gate_blank_coef=self.activation_gate_blank_coef,
+                activation_gate_nonblank_coef=self.activation_gate_nonblank_coef,
+            )
+            new_pred_logits = gated_log_probs.softmax(-1)
         
         
         blank_tensor = torch.zeros_like(new_pred_logits) + 1e-5
@@ -639,6 +706,16 @@ class SetCriterion(nn.Module):
 
         blank_pred_ratio = (new_pred_logits.argmax(-1) == 0).float().mean()
         losses = {"loss_CTC": loss, "blank_pred_ratio": blank_pred_ratio.detach()}
+
+        if self.query_count_loss_enabled and activation_logits is not None:
+            query_count_loss, expected_activation_count = compute_query_count_loss(
+                activation_logits,
+                length_input.float(),
+                short_weight=self.query_count_short_weight,
+            )
+            losses["loss_query_count"] = query_count_loss
+            losses["query_expected_count"] = expected_activation_count.detach().mean()
+            losses["query_target_count"] = length_input.float().detach().mean()
 
         if self.ctc_count_loss_enabled:
             target_count = length_input.float().to(device).clamp(min=1.0)
@@ -1286,6 +1363,7 @@ def build_dino(args):
         dn_label_noise_ratio=args.dn_label_noise_ratio,
         dn_labelbook_size=dn_labelbook_size,
         use_direction_head=getattr(args, "use_direction_head", False),
+        use_query_activation_head=getattr(args, "use_query_activation_head", False),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -1351,6 +1429,9 @@ def build_dino(args):
     short_gt_ce_loss_coef = getattr(args, "short_gt_ce_loss_coef", 0.0)
     if short_gt_ce_loss_coef > 0:
         weight_dict["loss_short_gt_ce"] = short_gt_ce_loss_coef
+    query_count_loss_coef = getattr(args, "query_count_loss_coef", 0.0)
+    if getattr(args, "use_query_count_loss", False) and query_count_loss_coef > 0:
+        weight_dict["loss_query_count"] = query_count_loss_coef
     if getattr(args, "use_direction_head", False):
         weight_dict["loss_direction"] = getattr(args, "direction_loss_coef", 1.0)
 
@@ -1366,12 +1447,19 @@ def build_dino(args):
         weight_dict=weight_dict,
         focal_alpha=args.focal_alpha,
         losses=losses,
+        CTC=getattr(args, "mode_chr", False),
         ctc_blank_max=getattr(args, "ctc_blank_max", 1.0),
         ctc_count_loss_short_weight=getattr(args, "ctc_count_loss_short_weight", 1.0),
         short_gt_presence_max_len=getattr(args, "short_gt_presence_max_len", 0),
         short_gt_presence_margin=getattr(args, "short_gt_presence_margin", 0.0),
         short_gt_ce_max_len=getattr(args, "short_gt_ce_max_len", 0),
         short_gt_ce_gamma=getattr(args, "short_gt_ce_gamma", 0.0),
+        use_query_activation_head=getattr(args, "use_query_activation_head", False),
+        use_query_count_loss=getattr(args, "use_query_count_loss", False),
+        use_activation_gating=getattr(args, "use_activation_gating", False),
+        activation_gate_blank_coef=getattr(args, "activation_gate_blank_coef", 0.0),
+        activation_gate_nonblank_coef=getattr(args, "activation_gate_nonblank_coef", 0.0),
+        query_count_short_weight=getattr(args, "query_count_short_weight", 1.0),
     )
     criterion.to(device)
     postprocessors = {
