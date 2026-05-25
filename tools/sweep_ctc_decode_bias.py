@@ -15,14 +15,12 @@ import util.misc as utils
 from datasets import build_dataset
 from finetuning import build_model_main
 from tools.analyze_ctc_errors import (
-    Totals,
     _adapt_class_head,
     _load_compatible_state,
-    length_bin,
-    levenshtein_ops,
     load_cfg_to_args,
-    remove_duplicates,
 )
+from util.ctc_decoding import apply_ctc_calibration, decode_greedy
+from util.ctc_metrics import CtcTotals as Totals, LENGTH_BIN_KEYS, length_bin, levenshtein_ops
 from util.slconfig import DictAction
 
 
@@ -75,31 +73,11 @@ def build_settings(cli):
                 )
     return settings
 
-
-def ratio_from_target(target):
-    orig_size = target["orig_size"]
-    if torch.is_tensor(orig_size):
-        h, w = orig_size.detach().cpu().tolist()
-    else:
-        h, w = orig_size
-    return float(h) / max(float(w), 1.0)
-
-
-def calibrated_argmax(pred_probs, target, setting, cli):
-    scores = torch.log(pred_probs.clamp(min=1e-12))
-    scores[..., 0] += setting["blank_bias"]
-    scores[..., 1:] += setting["nonblank_bias"]
-    ratio = ratio_from_target(target)
-    if cli.ratio_min < ratio <= cli.ratio_max:
-        scores[..., 1:] += setting["ratio_nonblank_bias"]
-    return scores.argmax(-1)[0].tolist()
-
-
 def make_summary(total, by_len_bin):
     summary = total.to_summary()
     summary["by_gt_len_bin"] = {
         key: by_len_bin[key].to_summary()
-        for key in ["1", "2", "3-5", "6-10", "11+"]
+        for key in LENGTH_BIN_KEYS
         if by_len_bin[key].n > 0
     }
     return summary
@@ -151,9 +129,16 @@ def main():
             gt_bin = length_bin(gt_len)
 
             for idx, setting in enumerate(settings):
-                pred_tokens = calibrated_argmax(pred_probs, targets[0], setting, cli)
-                pred_tokens = remove_duplicates(pred_tokens)
-                pred_labels = [t - 1 for t in pred_tokens if 1 <= t <= len(dataset.charset)]
+                calibrated_scores = apply_ctc_calibration(
+                    pred_probs,
+                    target=targets[0],
+                    blank_bias=setting["blank_bias"],
+                    nonblank_bias=setting["nonblank_bias"],
+                    ratio_nonblank_bias=setting["ratio_nonblank_bias"],
+                    ratio_min=cli.ratio_min,
+                    ratio_max=cli.ratio_max,
+                )
+                pred_labels = decode_greedy(calibrated_scores, len(dataset.charset))
                 pred_len = len(pred_labels)
                 dist, ins, dels, subs = levenshtein_ops(gt_labels, pred_labels)
                 totals[idx].add(gt_len, pred_len, dist, ins, dels, subs)

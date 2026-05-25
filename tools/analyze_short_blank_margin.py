@@ -17,10 +17,10 @@ from finetuning import build_model_main
 from tools.analyze_ctc_errors import (
     _adapt_class_head,
     _load_compatible_state,
-    levenshtein_ops,
     load_cfg_to_args,
-    remove_duplicates,
 )
+from util.ctc_decoding import decode_greedy
+from util.ctc_metrics import levenshtein_ops
 from util.slconfig import DictAction
 
 
@@ -45,13 +45,6 @@ def parse_args():
         help="Override config values, same format as finetuning.py --options.",
     )
     return parser.parse_args()
-
-
-def decode_greedy(pred_probs, charset_size):
-    pred_tokens = pred_probs.argmax(-1)[0].tolist()
-    pred_tokens = remove_duplicates(pred_tokens)
-    return [t - 1 for t in pred_tokens if 1 <= t <= charset_size]
-
 
 def label_text(labels, charset):
     return "".join(charset[int(x)] for x in labels)
@@ -247,4 +240,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

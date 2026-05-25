@@ -15,14 +15,12 @@ import util.misc as utils
 from datasets import build_dataset
 from finetuning import build_model_main
 from tools.analyze_ctc_errors import (
-    Totals,
     _adapt_class_head,
     _load_compatible_state,
-    length_bin,
-    levenshtein_ops,
     load_cfg_to_args,
-    remove_duplicates,
 )
+from util.ctc_decoding import decode_greedy, ratio_from_target
+from util.ctc_metrics import CtcTotals as Totals, LENGTH_BIN_KEYS, length_bin, levenshtein_ops
 from util.slconfig import DictAction
 
 
@@ -48,22 +46,8 @@ def parse_args():
     )
     return parser.parse_args()
 
-
-def ratio_from_target(target):
-    orig_size = target.get("orig_size")
-    if orig_size is None:
-        return 1.0
-    if torch.is_tensor(orig_size):
-        h, w = orig_size.detach().cpu().tolist()
-    else:
-        h, w = orig_size
-    return float(h) / max(float(w), 1.0)
-
-
 def decode_baseline(pred_probs, charset_size):
-    pred_tokens = pred_probs.argmax(-1)[0].tolist()
-    pred_tokens = remove_duplicates(pred_tokens)
-    return [t - 1 for t in pred_tokens if 1 <= t <= charset_size]
+    return decode_greedy(pred_probs, charset_size)
 
 
 def candidate_nonblank_labels(pred_probs, charset_size, topk):
@@ -132,7 +116,7 @@ def summarize(total, by_len_bin):
     summary = total.to_summary()
     summary["by_gt_len_bin"] = {
         key: by_len_bin[key].to_summary()
-        for key in ["1", "2", "3-5", "6-10", "11+"]
+        for key in LENGTH_BIN_KEYS
         if by_len_bin[key].n > 0
     }
     return summary
@@ -266,4 +250,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
