@@ -46,11 +46,21 @@ def parse_args():
     )
     return parser.parse_args()
 
+
+def require_single_sample_probs(pred_probs, *, context):
+    if pred_probs.ndim != 3 or pred_probs.shape[0] != 1:
+        raise ValueError(
+            f"{context} expects CTC probabilities with shape [1, T, C]; "
+            f"got {tuple(pred_probs.shape)}"
+        )
+
+
 def label_text(labels, charset):
     return "".join(charset[int(x)] for x in labels)
 
 
 def short_margin_stats(pred_probs, gt_labels, charset_size, topk_queries):
+    require_single_sample_probs(pred_probs, context="analyze_short_blank_margin.short_margin_stats")
     probs = pred_probs[0]
     blank_probs = probs[:, 0]
     nonblank_probs = probs[:, 1 : charset_size + 1]
@@ -167,6 +177,7 @@ def main():
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
             outputs = model(samples)
             _, pred_probs, _ = criterion.loss_CTC(outputs, targets, None, None, return_preds=True)
+            require_single_sample_probs(pred_probs, context="analyze_short_blank_margin")
 
             gt_labels = [int(x) for x in targets[0]["labels"].tolist()]
             pred_labels = decode_greedy(pred_probs, len(dataset.charset))

@@ -46,11 +46,22 @@ def parse_args():
     )
     return parser.parse_args()
 
+
+def require_single_sample_probs(pred_probs, *, context):
+    if pred_probs.ndim != 3 or pred_probs.shape[0] != 1:
+        raise ValueError(
+            f"{context} expects CTC probabilities with shape [1, T, C]; "
+            f"got {tuple(pred_probs.shape)}"
+        )
+
+
 def decode_baseline(pred_probs, charset_size):
+    require_single_sample_probs(pred_probs, context="evaluate_short_rescue.decode_baseline")
     return decode_greedy(pred_probs, charset_size)
 
 
 def candidate_nonblank_labels(pred_probs, charset_size, topk):
+    require_single_sample_probs(pred_probs, context="evaluate_short_rescue.candidate_nonblank_labels")
     probs = pred_probs[0]
     nonblank = probs[:, 1 : charset_size + 1]
     best_scores, best_labels = nonblank.max(dim=-1)
@@ -165,6 +176,7 @@ def main():
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
             outputs = model(samples)
             _, pred_probs, _ = criterion.loss_CTC(outputs, targets, None, None, return_preds=True)
+            require_single_sample_probs(pred_probs, context="evaluate_short_rescue")
 
             gt_labels = [int(x) for x in targets[0]["labels"].tolist()]
             gt_len = len(gt_labels)

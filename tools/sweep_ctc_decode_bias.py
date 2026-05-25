@@ -73,6 +73,47 @@ def build_settings(cli):
                 )
     return settings
 
+
+def require_single_sample_probs(pred_probs, *, context):
+    if pred_probs.ndim != 3 or pred_probs.shape[0] != 1:
+        raise ValueError(
+            f"{context} expects CTC probabilities with shape [1, T, C]; "
+            f"got {tuple(pred_probs.shape)}"
+        )
+
+
+def validate_ratio_bias_target(target):
+    orig_size = target.get("orig_size") if isinstance(target, dict) else None
+    if orig_size is None:
+        raise ValueError(
+            "ratio-conditioned CTC bias requires target['orig_size'] with at least "
+            "height and width values"
+        )
+    if torch.is_tensor(orig_size):
+        values = orig_size.detach().cpu().reshape(-1).tolist()
+    else:
+        try:
+            values = list(orig_size)
+        except TypeError as exc:
+            raise ValueError(
+                "ratio-conditioned CTC bias requires target['orig_size'] to be an iterable "
+                "of height and width values"
+            ) from exc
+    if len(values) < 2:
+        raise ValueError(
+            "ratio-conditioned CTC bias requires target['orig_size'] with at least "
+            "height and width values"
+        )
+    try:
+        float(values[0])
+        float(values[1])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "ratio-conditioned CTC bias requires numeric height/width in "
+            "target['orig_size']"
+        ) from exc
+
+
 def make_summary(total, by_len_bin):
     summary = total.to_summary()
     summary["by_gt_len_bin"] = {
@@ -123,12 +164,15 @@ def main():
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
             outputs = model(samples)
             _, pred_probs, _ = criterion.loss_CTC(outputs, targets, None, None, return_preds=True)
+            require_single_sample_probs(pred_probs, context="sweep_ctc_decode_bias")
 
             gt_labels = [int(x) for x in targets[0]["labels"].tolist()]
             gt_len = len(gt_labels)
             gt_bin = length_bin(gt_len)
 
             for idx, setting in enumerate(settings):
+                if setting["ratio_nonblank_bias"] != 0.0:
+                    validate_ratio_bias_target(targets[0])
                 calibrated_scores = apply_ctc_calibration(
                     pred_probs,
                     target=targets[0],
