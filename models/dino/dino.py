@@ -105,6 +105,7 @@ class DINO(nn.Module):
         dn_labelbook_size=100,
         use_direction_head=False,
         use_query_activation_head=False,
+        query_activation_init_bias=0.0,
     ):
         """Initializes the model.
         Parameters:
@@ -129,6 +130,7 @@ class DINO(nn.Module):
         self.label_enc = nn.Embedding(dn_labelbook_size + 1, hidden_dim)
         self.use_direction_head = use_direction_head
         self.use_query_activation_head = use_query_activation_head
+        self.query_activation_init_bias = float(query_activation_init_bias)
 
         # setting query dim
         self.query_dim = query_dim
@@ -262,6 +264,10 @@ class DINO(nn.Module):
             self.direction_embed = nn.Linear(hidden_dim, 2)
         if self.use_query_activation_head:
             self.query_activation_embed = nn.Linear(hidden_dim, 1)
+            nn.init.constant_(
+                self.query_activation_embed.bias.data,
+                self.query_activation_init_bias,
+            )
 
     def _reset_parameters(self):
         # init input_proj
@@ -1364,6 +1370,7 @@ def build_dino(args):
         dn_labelbook_size=dn_labelbook_size,
         use_direction_head=getattr(args, "use_direction_head", False),
         use_query_activation_head=getattr(args, "use_query_activation_head", False),
+        query_activation_init_bias=getattr(args, "query_activation_init_bias", 0.0),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
