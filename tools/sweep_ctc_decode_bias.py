@@ -1,7 +1,6 @@
 import argparse
 import json
 from collections import defaultdict
-from collections.abc import Sequence
 from numbers import Number
 from pathlib import Path
 import sys
@@ -105,17 +104,19 @@ def validate_ratio_bias_target(target):
                 "ratio-conditioned CTC bias requires target['orig_size'] to be a "
                 "non-string sequence of numeric height and width values"
             )
-        if not isinstance(orig_size, Sequence):
+        try:
+            values = list(orig_size)
+        except TypeError:
             raise ValueError(
                 "ratio-conditioned CTC bias requires target['orig_size'] to be a "
                 "non-string sequence of numeric height and width values"
             )
-        if len(orig_size) < 2:
+        if len(values) < 2:
             raise ValueError(
                 "ratio-conditioned CTC bias requires target['orig_size'] with at least "
                 "height and width values"
             )
-        if not isinstance(orig_size[0], Number) or not isinstance(orig_size[1], Number):
+        if not isinstance(values[0], Number) or not isinstance(values[1], Number):
             raise ValueError(
                 "ratio-conditioned CTC bias requires numeric height/width in "
                 "target['orig_size']"
