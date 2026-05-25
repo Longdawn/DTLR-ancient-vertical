@@ -12,19 +12,113 @@ from __future__ import division
 
 import warnings
 import math
+import os
+from pathlib import Path
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.nn.init import xavier_uniform_, constant_
 
-from ..functions import MSDeformAttnFunction
+from ..functions import MSDeformAttnFunction, ms_deform_attn_core_pytorch
 
 
 def _is_power_of_2(n):
     if (not isinstance(n, int)) or (n < 0):
         raise ValueError("invalid input for _is_power_of_2: {} (type: {})".format(n, type(n)))
     return (n & (n-1) == 0) and n != 0
+
+
+def _env_flag(name, default="0"):
+    return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _tensor_summary(name, tensor):
+    if tensor is None:
+        return f"{name}=None"
+    if not torch.is_tensor(tensor):
+        return f"{name}=<{type(tensor).__name__}>"
+
+    parts = [
+        f"{name}.shape={tuple(tensor.shape)}",
+        f"{name}.dtype={tensor.dtype}",
+        f"{name}.device={tensor.device}",
+    ]
+    if tensor.numel() == 0:
+        parts.append(f"{name}.empty=True")
+        return " ".join(parts)
+
+    finite_mask = torch.isfinite(tensor)
+    finite = bool(finite_mask.all().item())
+    parts.append(f"{name}.finite={finite}")
+    if finite:
+        parts.append(f"{name}.min={tensor.min().item():.6g}")
+        parts.append(f"{name}.max={tensor.max().item():.6g}")
+        parts.append(f"{name}.mean={tensor.float().mean().item():.6g}")
+    else:
+        if torch.is_floating_point(tensor):
+            parts.append(f"{name}.nan_count={int(torch.isnan(tensor).sum().item())}")
+            parts.append(f"{name}.inf_count={int(torch.isinf(tensor).sum().item())}")
+    return " ".join(parts)
+
+
+def _build_debug_context(
+    query,
+    reference_points,
+    input_flatten,
+    input_spatial_shapes,
+    input_level_start_index,
+    input_padding_mask,
+    value,
+    sampling_offsets,
+    attention_weights,
+    sampling_locations,
+):
+    return " | ".join(
+        [
+            _tensor_summary("query", query),
+            _tensor_summary("reference_points", reference_points),
+            _tensor_summary("input_flatten", input_flatten),
+            _tensor_summary("input_spatial_shapes", input_spatial_shapes),
+            _tensor_summary("input_level_start_index", input_level_start_index),
+            _tensor_summary("input_padding_mask", input_padding_mask),
+            _tensor_summary("value", value),
+            _tensor_summary("sampling_offsets", sampling_offsets),
+            _tensor_summary("attention_weights", attention_weights),
+            _tensor_summary("sampling_locations", sampling_locations),
+        ]
+    )
+
+
+_MSDA_DUMP_COUNTER = 0
+
+
+def _maybe_dump_msda_inputs(
+    value,
+    input_spatial_shapes,
+    input_level_start_index,
+    sampling_locations,
+    attention_weights,
+):
+    global _MSDA_DUMP_COUNTER
+    dump_dir = os.environ.get("DTLR_MSDA_DUMP_DIR", "").strip()
+    if not dump_dir:
+        return
+    if _MSDA_DUMP_COUNTER > 0 and not _env_flag("DTLR_MSDA_DUMP_EVERY_CALL"):
+        return
+
+    path = Path(dump_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    dump_path = path / f"msda_dump_{_MSDA_DUMP_COUNTER:04d}.pt"
+    payload = {
+        "value": value.detach().cpu(),
+        "spatial_shapes": input_spatial_shapes.detach().cpu(),
+        "level_start_index": input_level_start_index.detach().cpu(),
+        "sampling_locations": sampling_locations.detach().cpu(),
+        "attention_weights": attention_weights.detach().cpu(),
+    }
+    torch.save(payload, dump_path)
+    _MSDA_DUMP_COUNTER += 1
 
 
 class MSDeformAttn(nn.Module):
@@ -110,17 +204,76 @@ class MSDeformAttn(nn.Module):
             raise ValueError(
                 'Last dim of reference_points must be 2 or 4, but get {} instead.'.format(reference_points.shape[-1]))
 
-        # for amp
+        debug_enabled = _env_flag("DTLR_MSDA_DIAG")
+        force_pytorch = _env_flag("DTLR_MSDA_FORCE_PYTORCH")
+        fallback_on_error = _env_flag("DTLR_MSDA_FALLBACK_ON_ERROR")
+
+        debug_context = None
+        if debug_enabled:
+            debug_context = _build_debug_context(
+                query=query,
+                reference_points=reference_points,
+                input_flatten=input_flatten,
+                input_spatial_shapes=input_spatial_shapes,
+                input_level_start_index=input_level_start_index,
+                input_padding_mask=input_padding_mask,
+                value=value,
+                sampling_offsets=sampling_offsets,
+                attention_weights=attention_weights,
+                sampling_locations=sampling_locations,
+            )
+
+        def _run_pytorch_core(core_value, core_locations, output_dtype):
+            core_output = ms_deform_attn_core_pytorch(
+                core_value,
+                input_spatial_shapes,
+                core_locations,
+                attention_weights.to(core_value.dtype),
+            )
+            if output_dtype is not None:
+                core_output = core_output.to(output_dtype)
+            return self.output_proj(core_output.to(query.dtype))
+
+        kernel_value = value
+        kernel_locations = sampling_locations
+        kernel_attention_weights = attention_weights
+        output_cast_dtype = None
+
         if value.dtype == torch.float16:
-            # for mixed precision
+            kernel_value = value.to(torch.float32)
+            kernel_locations = sampling_locations.to(torch.float32)
+            output_cast_dtype = torch.float16
+
+        _maybe_dump_msda_inputs(
+            kernel_value,
+            input_spatial_shapes,
+            input_level_start_index,
+            kernel_locations,
+            kernel_attention_weights,
+        )
+
+        if force_pytorch:
+            return _run_pytorch_core(kernel_value, kernel_locations, output_cast_dtype)
+
+        try:
             output = MSDeformAttnFunction.apply(
-            value.to(torch.float32), input_spatial_shapes, input_level_start_index, sampling_locations.to(torch.float32), attention_weights, self.im2col_step)
-            output = output.to(torch.float16)
+                kernel_value,
+                input_spatial_shapes,
+                input_level_start_index,
+                kernel_locations,
+                kernel_attention_weights,
+                self.im2col_step,
+            )
+            if output_cast_dtype is not None:
+                output = output.to(output_cast_dtype)
             output = self.output_proj(output)
             return output
-
-
-        output = MSDeformAttnFunction.apply(
-            value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
-        output = self.output_proj(output)
-        return output
+        except Exception as exc:
+            if fallback_on_error:
+                warnings.warn(
+                    "MSDeformAttn CUDA path failed; falling back to PyTorch core for debugging."
+                )
+                return _run_pytorch_core(kernel_value, kernel_locations, output_cast_dtype)
+            if debug_context is not None:
+                raise RuntimeError(f"{exc}\n[MSDeformAttn debug] {debug_context}") from exc
+            raise

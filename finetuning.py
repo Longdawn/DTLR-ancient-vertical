@@ -3,6 +3,7 @@
 TENSORBOARD = False
 
 import argparse
+import ast
 import datetime
 import json
 import random
@@ -24,6 +25,7 @@ import datasets
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate_CTC, train_one_epoch, train_one_epoch_CTC
 import pickle
+from collections import Counter
 
 if TENSORBOARD:
     from torch.utils.tensorboard import SummaryWriter
@@ -32,6 +34,81 @@ if TENSORBOARD:
 else:
     import wandb
 os.environ["WANDB_SILENT"] = "true"
+
+
+def _maybe_parse_literal(value):
+    if isinstance(value, str):
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return value
+    return value
+
+
+def _normalize_old_charset_for_mapping(old_charset, new_charset):
+    if not old_charset or not new_charset:
+        return old_charset
+
+    new_example = new_charset[0]
+    old_example = old_charset[0]
+
+    if isinstance(new_example, str) and isinstance(old_example, int):
+        normalized = []
+        for item in old_charset:
+            try:
+                normalized.append(chr(int(item)))
+            except Exception:
+                normalized.append(str(item))
+        return normalized
+
+    if isinstance(new_example, int) and isinstance(old_example, str):
+        normalized = []
+        for item in old_charset:
+            if isinstance(item, str) and len(item) == 1:
+                normalized.append(ord(item))
+            else:
+                normalized.append(item)
+        return normalized
+
+    return old_charset
+
+
+def _init_linear_from_random_rows(dst_linear, src_linear):
+    """Initialize each output row from a random pretrained output row."""
+    with torch.no_grad():
+        src_rows = src_linear.weight.data.shape[0]
+        indices = torch.randint(0, src_rows, (dst_linear.weight.data.shape[0],))
+        dst_linear.weight.data.copy_(src_linear.weight.data[indices].clone())
+        if dst_linear.bias is not None and src_linear.bias is not None:
+            dst_linear.bias.data.copy_(src_linear.bias.data[indices].clone())
+
+
+def _init_modulelist_from_random_rows(dst_modulelist, src_modulelist):
+    seen = set()
+    src_ref = src_modulelist[0]
+    for module in dst_modulelist:
+        module_id = id(module)
+        if module_id in seen:
+            continue
+        _init_linear_from_random_rows(module, src_ref)
+        seen.add(module_id)
+
+
+def _freeze_all_but(model, trainable_parameters):
+    trainable_ids = {id(p) for p in trainable_parameters}
+    previous_requires_grad = {}
+    for name, parameter in model.named_parameters():
+        previous_requires_grad[name] = parameter.requires_grad
+        parameter.requires_grad_(id(parameter) in trainable_ids)
+    return previous_requires_grad
+
+
+def _restore_requires_grad(model, previous_requires_grad):
+    if previous_requires_grad is None:
+        return
+    for name, parameter in model.named_parameters():
+        if name in previous_requires_grad:
+            parameter.requires_grad_(previous_requires_grad[name])
 
 
 def get_args_parser():
@@ -120,6 +197,92 @@ class WithReplacementRandomSampler(Sampler):
         return len(self.data_source)
 
 
+LENGTH_BIN_KEYS = ["1", "2", "3-5", "6-10", "11+"]
+
+
+def _length_bin_from_gt_len(gt_len):
+    gt_len = int(gt_len)
+    if gt_len <= 1:
+        return "1"
+    if gt_len == 2:
+        return "2"
+    if gt_len <= 5:
+        return "3-5"
+    if gt_len <= 10:
+        return "6-10"
+    return "11+"
+
+
+def _normalize_length_balance_weights(raw_weights):
+    if raw_weights is None:
+        return {"1": 4.0, "2": 3.0, "3-5": 2.0, "6-10": 1.0, "11+": 1.0}
+
+    if isinstance(raw_weights, dict):
+        normalized = {}
+        for key in LENGTH_BIN_KEYS:
+            normalized[key] = float(raw_weights.get(key, 1.0))
+        return normalized
+
+    if isinstance(raw_weights, (list, tuple)) and len(raw_weights) == len(LENGTH_BIN_KEYS):
+        return {key: float(value) for key, value in zip(LENGTH_BIN_KEYS, raw_weights)}
+
+    raise ValueError(
+        "mth1000_length_sample_weights must be a dict keyed by "
+        f"{LENGTH_BIN_KEYS} or a list/tuple of length {len(LENGTH_BIN_KEYS)}"
+    )
+
+
+def _build_length_balanced_sampler(dataset, args, logger):
+    if not getattr(args, "mth1000_length_balance", False):
+        return None
+
+    if not hasattr(dataset, "samples"):
+        logger.info(
+            "Length-balanced sampling requested, but dataset has no `samples` attribute. "
+            "Falling back to RandomSampler."
+        )
+        return None
+
+    weights_cfg = _normalize_length_balance_weights(
+        _maybe_parse_literal(getattr(args, "mth1000_length_sample_weights", None))
+    )
+
+    per_sample_weights = []
+    raw_counts = Counter()
+    weighted_counts = Counter()
+
+    for sample in dataset.samples:
+        text = sample.get("text", "") if isinstance(sample, dict) else ""
+        bucket = _length_bin_from_gt_len(len(text))
+        sample_weight = float(weights_cfg[bucket])
+        per_sample_weights.append(sample_weight)
+        raw_counts[bucket] += 1
+        weighted_counts[bucket] += sample_weight
+
+    if not per_sample_weights:
+        logger.info(
+            "Length-balanced sampling requested, but dataset is empty. "
+            "Falling back to RandomSampler."
+        )
+        return None
+
+    total_weight = sum(weighted_counts.values())
+    effective_dist = {
+        key: (weighted_counts[key] / total_weight if total_weight > 0 else 0.0)
+        for key in LENGTH_BIN_KEYS
+    }
+    logger.info(
+        "Using length-balanced WeightedRandomSampler with weights="
+        f"{weights_cfg}, raw_counts={dict(raw_counts)}, effective_dist={effective_dist}"
+    )
+
+    return torch.utils.data.WeightedRandomSampler(
+        weights=torch.as_tensor(per_sample_weights, dtype=torch.double),
+        num_samples=len(per_sample_weights),
+        replacement=True,
+    )
+
+
 def build_model_main(args):
     # we use register to maintain models from catdet6 on.
     from models.registry import MODULE_BUILD_FUNCS
@@ -163,6 +326,65 @@ def main(args):
         args.mode_chr = True
     if not getattr(args, "eval_epoch", None):
         args.eval_epoch = 1
+    if not hasattr(args, "use_direction_head"):
+        args.use_direction_head = False
+    if not hasattr(args, "direction_loss_coef"):
+        args.direction_loss_coef = 1.0
+    if not hasattr(args, "decode_by_pred_direction"):
+        args.decode_by_pred_direction = False
+    if not hasattr(args, "deform_attn_debug"):
+        args.deform_attn_debug = False
+    if not hasattr(args, "deform_attn_force_pytorch"):
+        args.deform_attn_force_pytorch = False
+    if not hasattr(args, "deform_attn_fallback_on_error"):
+        args.deform_attn_fallback_on_error = False
+    if not hasattr(args, "deform_attn_dump_dir"):
+        args.deform_attn_dump_dir = None
+    if not hasattr(args, "direction_source"):
+        args.direction_source = "label"
+    if not hasattr(args, "ctc_blank_max"):
+        args.ctc_blank_max = 1.0
+    if not hasattr(args, "max_skipped_batches"):
+        args.max_skipped_batches = 200
+    if not hasattr(args, "mth1000_length_balance"):
+        args.mth1000_length_balance = False
+    if not hasattr(args, "mth1000_length_sample_weights"):
+        args.mth1000_length_sample_weights = None
+    if not hasattr(args, "step_lr_schedule"):
+        args.step_lr_schedule = []
+    if not hasattr(args, "exact_checkpoint_steps"):
+        args.exact_checkpoint_steps = []
+    if not hasattr(args, "max_optimizer_steps"):
+        args.max_optimizer_steps = None
+    if not hasattr(args, "new_class_warmup_steps"):
+        args.new_class_warmup_steps = 0
+
+    args.lr_drop_list = _maybe_parse_literal(getattr(args, "lr_drop_list", []))
+    args.step_lr_schedule = _maybe_parse_literal(getattr(args, "step_lr_schedule", []))
+    args.exact_checkpoint_steps = _maybe_parse_literal(
+        getattr(args, "exact_checkpoint_steps", [])
+    )
+    args.max_optimizer_steps = _maybe_parse_literal(
+        getattr(args, "max_optimizer_steps", None)
+    )
+    args.mth1000_length_balance = bool(
+        _maybe_parse_literal(getattr(args, "mth1000_length_balance", False))
+    )
+    args.mth1000_length_sample_weights = _maybe_parse_literal(
+        getattr(args, "mth1000_length_sample_weights", None)
+    )
+    args.new_class_warmup_steps = int(
+        _maybe_parse_literal(getattr(args, "new_class_warmup_steps", 0)) or 0
+    )
+
+    if args.debug or args.deform_attn_debug:
+        os.environ["DTLR_MSDA_DIAG"] = "1"
+    if args.deform_attn_force_pytorch:
+        os.environ["DTLR_MSDA_FORCE_PYTORCH"] = "1"
+    if args.deform_attn_fallback_on_error:
+        os.environ["DTLR_MSDA_FALLBACK_ON_ERROR"] = "1"
+    if getattr(args, "deform_attn_dump_dir", None):
+        os.environ["DTLR_MSDA_DUMP_DIR"] = str(args.deform_attn_dump_dir)
 
     # setup logger
     os.makedirs(args.output_dir, exist_ok=True)
@@ -237,7 +459,9 @@ def main(args):
         sampler_train = DistributedSampler(dataset_train)
         sampler_val = DistributedSampler(dataset_val, shuffle=False)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
+        sampler_train = _build_length_balanced_sampler(dataset_train, args, logger)
+        if sampler_train is None:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
     batch_sampler_train = torch.utils.data.BatchSampler(
@@ -260,6 +484,8 @@ def main(args):
     )
 
     args.charset = dataset_train.charset
+    new_class_warmup_parameters = None
+
     if args.new_class_embedding and args.resume_finetuning:
         device = args.device
 
@@ -303,6 +529,9 @@ def main(args):
                     "r",
                 ) as f:
                     old_charset = json.load(f)
+            old_charset = _normalize_old_charset_for_mapping(
+                old_charset, args.charset
+            )
             not_mapped = []
             possible_mapping = list(range(len(old_charset)))
             mapping = {}
@@ -361,9 +590,16 @@ def main(args):
                 + list(model.transformer.enc_out_class_embed.parameters())
             )
         else:
+            _init_modulelist_from_random_rows(new_class_embed, model.class_embed)
+            _init_linear_from_random_rows(
+                new_decoder_class_embed, model.transformer.decoder.class_embed[0]
+            )
+            _init_linear_from_random_rows(
+                new_enc_out_class_embed, model.transformer.enc_out_class_embed
+            )
             model.transformer.decoder.class_embed = new_decoder_class_embed.to(device)
             model.class_embed = new_class_embed.to(device)
-            # model.transformer.enc_out_class_embed = new_enc_out_class_embed.to(device)
+            model.transformer.enc_out_class_embed = new_enc_out_class_embed.to(device)
             model.label_enc = nn.Embedding(
                 len(dataset_val.charset) + 1, features_dim
             ).to(
@@ -376,15 +612,49 @@ def main(args):
                 + list(model.transformer.enc_out_class_embed.parameters())
             )
 
+        if getattr(args, "use_direction_head", False) and hasattr(model, "direction_embed"):
+            parameters_to_optimize += list(model.direction_embed.parameters())
+
         # optimizer = torch.optim.AdamW(parameters_to_optimize, lr=args.lr,weight_decay=args.weight_decay)
 
-    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
-    scheduler_constant = torch.optim.lr_scheduler.StepLR(
-        optimizer, 1, gamma=1, last_epoch=-1
-    )
-    lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[scheduler_constant, scheduler_constant], milestones=[2]
-    )
+    def _build_scheduler(current_optimizer):
+        if getattr(args, "auto_lr_plateau", False):
+            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+                current_optimizer,
+                mode=getattr(args, "auto_lr_mode", "min"),
+                factor=float(getattr(args, "auto_lr_factor", 0.5)),
+                patience=int(getattr(args, "auto_lr_patience", 1)),
+                threshold=float(getattr(args, "auto_lr_threshold", 1e-4)),
+                threshold_mode=getattr(args, "auto_lr_threshold_mode", "rel"),
+                cooldown=int(getattr(args, "auto_lr_cooldown", 0)),
+                min_lr=float(getattr(args, "auto_lr_min_lr", 1e-6)),
+            )
+
+        if args.onecyclelr:
+            return torch.optim.lr_scheduler.OneCycleLR(
+                current_optimizer,
+                max_lr=args.lr,
+                steps_per_epoch=len(data_loader_train),
+                epochs=args.epochs,
+                pct_start=float(getattr(args, "onecycle_pct_start", 0.2)),
+                div_factor=float(getattr(args, "onecycle_div_factor", 25.0)),
+                final_div_factor=float(
+                    getattr(args, "onecycle_final_div_factor", 1e4)
+                ),
+            )
+
+        if args.multi_step_lr:
+            return torch.optim.lr_scheduler.MultiStepLR(
+                current_optimizer,
+                milestones=list(args.lr_drop_list),
+                gamma=float(getattr(args, "multi_step_gamma", 0.1)),
+            )
+
+        return torch.optim.lr_scheduler.StepLR(
+            current_optimizer,
+            args.lr_drop,
+            gamma=float(getattr(args, "step_lr_gamma", 0.1)),
+        )
     if args.dataset_file == "coco_panoptic":
         # We also evaluate AP during panoptic training, on original coco DS
         coco_val = datasets.coco.build("val", args)
@@ -399,6 +669,21 @@ def main(args):
 
     output_dir = Path(args.output_dir)
 
+    def _load_compatible_state(model_obj, state_dict_raw):
+        clean_state = utils.clean_state_dict(state_dict_raw)
+        model_state = model_obj.state_dict()
+        filtered = {}
+        skipped = []
+        for k, v in clean_state.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                skipped.append(k)
+        load_out = model_obj.load_state_dict(filtered, strict=False)
+        logger.info(str(load_out))
+        if len(skipped) > 0:
+            logger.info(f"Skipped {len(skipped)} incompatible keys during load.")
+
     if os.path.exists(os.path.join(args.output_dir, "checkpoint.pth")):
         args.resume = os.path.join(args.output_dir, "checkpoint.pth")
     if args.resume:
@@ -409,7 +694,7 @@ def main(args):
         else:
             checkpoint = torch.load(args.resume, map_location="cpu")
 
-        model_without_ddp.load_state_dict(checkpoint["model"])
+        _load_compatible_state(model_without_ddp, checkpoint["model"])
         if args.use_ema:
             if "ema_model" in checkpoint:
                 ema_m.module.load_state_dict(
@@ -462,6 +747,9 @@ def main(args):
                     "r",
                 ) as f:
                     old_charset = json.load(f)
+            old_charset = _normalize_old_charset_for_mapping(
+                old_charset, args.charset
+            )
 
             not_mapped = []
             possible_mapping = list(range(len(old_charset)))
@@ -522,8 +810,16 @@ def main(args):
             )
 
         else:
+            _init_modulelist_from_random_rows(new_class_embed, model.class_embed)
+            _init_linear_from_random_rows(
+                new_decoder_class_embed, model.transformer.decoder.class_embed[0]
+            )
+            _init_linear_from_random_rows(
+                new_enc_out_class_embed, model.transformer.enc_out_class_embed
+            )
             model.class_embed = new_class_embed.to(device)
             model.transformer.decoder.class_embed = new_decoder_class_embed.to(device)
+            model.transformer.enc_out_class_embed = new_enc_out_class_embed.to(device)
             model.label_enc = nn.Embedding(
                 len(dataset_val.charset) + 1, features_dim
             ).to(device)
@@ -534,13 +830,30 @@ def main(args):
                 + list(model.transformer.enc_out_class_embed.parameters())
             )
 
+        if getattr(args, "use_direction_head", False) and hasattr(model, "direction_embed"):
+            parameters_to_optimize += list(model.direction_embed.parameters())
+
+        new_class_warmup_parameters = parameters_to_optimize
         optimizer = torch.optim.AdamW(
             parameters_to_optimize, lr=args.lr, weight_decay=args.weight_decay
         )
 
+        # When both --resume and --new_class_embedding are enabled, reload once
+        # after rebuilding heads so classifier weights can be restored correctly.
+        if args.resume:
+            if args.resume.startswith("https"):
+                checkpoint = torch.hub.load_state_dict_from_url(
+                    args.resume, map_location="cpu", check_hash=True
+                )
+            else:
+                checkpoint = torch.load(args.resume, map_location="cpu")
+            _load_compatible_state(model_without_ddp, checkpoint["model"])
+
     if (not args.resume) and args.pretrain_model_path:
-        checkpoint = torch.load(args.pretrain_model_path, map_location="cpu")["model"]
-        args.start_epoch = checkpoint["epoch"] + 1
+        checkpoint_full = torch.load(args.pretrain_model_path, map_location="cpu")
+        checkpoint = checkpoint_full["model"]
+        # `pretrain_model_path` is used for weight initialization only.
+        # Do not inherit the source checkpoint epoch into a new finetuning run.
         from collections import OrderedDict
 
         _ignorekeywordlist = args.finetune_ignore if args.finetune_ignore else []
@@ -565,8 +878,7 @@ def main(args):
             if check_keep(k, _ignorekeywordlist) is False:
                 print("Ignored: {}".format(k))
 
-        _load_output = model_without_ddp.load_state_dict(_tmp_st, strict=False)
-        logger.info(str(_load_output))
+        _load_compatible_state(model_without_ddp, _tmp_st)
 
         if args.use_ema:
             if "ema_model" in checkpoint:
@@ -576,6 +888,10 @@ def main(args):
             else:
                 del ema_m
                 ema_m = ModelEma(model, args.ema_decay)
+
+    # Optimizer can be rebuilt in new_class_embedding branches above.
+    # Always build scheduler after optimizer is finalized.
+    lr_scheduler = _build_scheduler(optimizer)
 
     if args.eval:
         run = wandb.init(project="OCRDETR-general-CTC", config=args, mode="disabled")
@@ -593,8 +909,9 @@ def main(args):
             wo_class_error=wo_class_error,
             args=args,
             run=run,
+            mode_chr=args.mode_chr,
         )
-        if args.output_dir:
+        if args.output_dir and coco_evaluator is not None:
             utils.save_on_master(
                 coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth"
             )
@@ -609,7 +926,119 @@ def main(args):
     # model.class_embed = new_class_embed
 
     print("Start training")
-    args.start_epoch = checkpoint["epoch"] + 1
+    best_cer = float("inf")
+    if args.new_class_embedding:
+        args.start_epoch = 0
+    elif "checkpoint" in locals() and isinstance(checkpoint, dict) and "epoch" in checkpoint:
+        args.start_epoch = checkpoint["epoch"] + 1
+    global_step = 0
+    if "checkpoint" in locals() and isinstance(checkpoint, dict):
+        global_step = int(checkpoint.get("global_step", 0))
+
+    exact_checkpoint_steps = sorted(
+        {int(step) for step in getattr(args, "exact_checkpoint_steps", [])}
+    )
+    saved_exact_checkpoint_steps = set()
+    warmup_state = {
+        "active": False,
+        "switch_step": int(getattr(args, "new_class_warmup_steps", 0)),
+        "saved_requires_grad": None,
+        "switched": False,
+    }
+
+    if (
+        args.new_class_embedding
+        and not args.resume_finetuning
+        and warmup_state["switch_step"] > 0
+        and new_class_warmup_parameters is not None
+    ):
+        if global_step < warmup_state["switch_step"]:
+            warmup_state["saved_requires_grad"] = _freeze_all_but(
+                model_without_ddp, new_class_warmup_parameters
+            )
+            warmup_state["active"] = True
+            if logger is not None:
+                logger.info(
+                    "Stage-1 finetuning active: optimizing only re-initialized "
+                    f"classification parameters until global_step={warmup_state['switch_step']}"
+                )
+        else:
+            if logger is not None:
+                logger.info(
+                    "Skipping stage-1 class-only warmup because global_step "
+                    f"{global_step} >= {warmup_state['switch_step']}"
+                )
+
+    def _build_weights(epoch, global_step_value):
+        weights = {
+            "model": model_without_ddp.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+            "epoch": epoch,
+            "global_step": int(global_step_value),
+            "args": args,
+        }
+        if args.use_ema:
+            weights.update({"ema_model": ema_m.module.state_dict()})
+        return weights
+
+    def _save_exact_step_checkpoint(global_step_value):
+        if global_step_value not in exact_checkpoint_steps:
+            return
+        if global_step_value in saved_exact_checkpoint_steps:
+            return
+
+        checkpoint_path = output_dir / f"checkpoint_step{int(global_step_value)}.pth"
+        utils.save_on_master(_build_weights(epoch, global_step_value), checkpoint_path)
+        if exact_checkpoint_steps and global_step_value == exact_checkpoint_steps[0]:
+            utils.save_on_master(
+                _build_weights(epoch, global_step_value),
+                output_dir / "checkpoint_stage1_end.pth",
+            )
+        saved_exact_checkpoint_steps.add(global_step_value)
+        if logger is not None:
+            logger.info(
+                f"Saved exact-step checkpoint at global_step={int(global_step_value)}"
+            )
+
+    def _after_step(global_step_value):
+        nonlocal optimizer, lr_scheduler
+        _save_exact_step_checkpoint(global_step_value)
+
+        if (
+            warmup_state["active"]
+            and (not warmup_state["switched"])
+            and global_step_value >= warmup_state["switch_step"]
+        ):
+            _restore_requires_grad(
+                model_without_ddp, warmup_state["saved_requires_grad"]
+            )
+            optimizer = torch.optim.AdamW(
+                get_param_dict(args, model_without_ddp),
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+            )
+            lr_scheduler = _build_scheduler(optimizer)
+            if getattr(args, "step_lr_schedule", []):
+                schedule = getattr(args, "step_lr_schedule", [])
+                if len(schedule) > 0:
+                    lr_value = schedule[0][1]
+                    for start_step, candidate_lr in schedule:
+                        if global_step_value >= int(start_step):
+                            lr_value = candidate_lr
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = lr_value
+            warmup_state["active"] = False
+            warmup_state["switched"] = True
+            if logger is not None:
+                logger.info(
+                    "Switching to stage-2 end-to-end finetuning at "
+                    f"global_step={global_step_value}"
+                )
+            return optimizer, lr_scheduler
+
+        return None
+
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         epoch_start_time = time.time()
@@ -620,7 +1049,7 @@ def main(args):
         except:
             pass
 
-        train_stats = train_one_epoch_CTC(
+        train_stats, global_step = train_one_epoch_CTC(
             model,
             criterion,
             data_loader_train,
@@ -634,6 +1063,8 @@ def main(args):
             logger=(logger if args.save_log else None),
             ema_m=ema_m,
             run=run,
+            global_step_start=global_step,
+            step_callback=_after_step,
         )
 
         if epoch % args.eval_epoch == 0:
@@ -660,45 +1091,70 @@ def main(args):
                 **{f"test_{k}": v for k, v in test_stats.items()},
             }
 
-            if True:
+            current_cer = test_stats.get("cer_oracle_direction", None)
+            if current_cer is None:
+                current_cer = test_stats.get("cer", None)
+            is_best = current_cer is not None and current_cer < best_cer
+            if is_best:
+                best_cer = current_cer
                 checkpoint_path = output_dir / "checkpoint_best_regular.pth"
                 utils.save_on_master(
-                    {
-                        "model": model_without_ddp.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "epoch": epoch,
-                        "args": args,
-                    },
+                    _build_weights(epoch, global_step),
                     checkpoint_path,
                 )
-                ep_paras = {"epoch": epoch, "n_parameters": n_parameters}
-                epoch_time = time.time() - epoch_start_time
-                epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
-                log_stats.update(ep_paras)
-                log_stats["epoch_time"] = epoch_time_str
+                if logger is not None:
+                    logger.info(
+                        f"New best checkpoint at epoch {epoch}, cer_oracle_direction={best_cer:.6f}"
+                    )
+            elif logger is not None and current_cer is not None:
+                logger.info(
+                    f"Epoch {epoch} not best. cer_oracle_direction={current_cer:.6f}, best={best_cer:.6f}"
+                )
 
-                if args.output_dir and utils.is_main_process():
-                    with (output_dir / "log.txt").open("a") as f:
-                        f.write(json.dumps(log_stats) + "\n")
+            ep_paras = {"epoch": epoch, "n_parameters": n_parameters}
+            epoch_time = time.time() - epoch_start_time
+            epoch_time_str = str(datetime.timedelta(seconds=int(epoch_time)))
+            log_stats.update(ep_paras)
+            log_stats["epoch_time"] = epoch_time_str
 
-                    # for evaluation logs
-                    if coco_evaluator is not None:
-                        (output_dir / "eval").mkdir(exist_ok=True)
-                        if "bbox" in coco_evaluator.coco_eval:
-                            filenames = ["latest.pth"]
-                            if epoch % 50 == 0:
-                                filenames.append(f"{epoch:03}.pth")
-                            for name in filenames:
-                                torch.save(
-                                    coco_evaluator.coco_eval["bbox"].eval,
-                                    output_dir / "eval" / name,
-                                )
+            if args.output_dir and utils.is_main_process():
+                with (output_dir / "log.txt").open("a") as f:
+                    f.write(json.dumps(log_stats) + "\n")
+
+                # for evaluation logs
+                if coco_evaluator is not None:
+                    (output_dir / "eval").mkdir(exist_ok=True)
+                    if "bbox" in coco_evaluator.coco_eval:
+                        filenames = ["latest.pth"]
+                        if epoch % 50 == 0:
+                            filenames.append(f"{epoch:03}.pth")
+                        for name in filenames:
+                            torch.save(
+                                coco_evaluator.coco_eval["bbox"].eval,
+                                output_dir / "eval" / name,
+                            )
 
         if args.output_dir:
             checkpoint_paths = [output_dir / "checkpoint.pth"]
 
-        if not args.onecyclelr:
+        if getattr(args, "step_lr_schedule", []):
+            pass
+        elif getattr(args, "auto_lr_plateau", False):
+            metric_for_plateau = None
+            if epoch % args.eval_epoch == 0:
+                metric_for_plateau = test_stats.get("cer_oracle_direction", None)
+                if metric_for_plateau is None:
+                    metric_for_plateau = test_stats.get("cer", None)
+                if metric_for_plateau is None:
+                    metric_for_plateau = test_stats.get("loss_CTC_unscaled", None)
+                if metric_for_plateau is None:
+                    metric_for_plateau = test_stats.get("loss", None)
+            if metric_for_plateau is None:
+                metric_for_plateau = train_stats.get("loss_CTC_unscaled", None)
+            if metric_for_plateau is None:
+                metric_for_plateau = train_stats.get("loss", 0.0)
+            lr_scheduler.step(metric_for_plateau)
+        elif not args.onecyclelr:
             lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / "checkpoint.pth"]
@@ -706,20 +1162,16 @@ def main(args):
             if (epoch + 1) % args.save_checkpoint_interval == 0:
                 checkpoint_paths.append(output_dir / f"checkpoint{epoch:04}.pth")
             for checkpoint_path in checkpoint_paths:
-                weights = {
-                    "model": model_without_ddp.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                    "epoch": epoch,
-                    "args": args,
-                }
-                if args.use_ema:
-                    weights.update(
-                        {
-                            "ema_model": ema_m.module.state_dict(),
-                        }
-                    )
-                utils.save_on_master(weights, checkpoint_path)
+                utils.save_on_master(_build_weights(epoch, global_step), checkpoint_path)
+
+        if getattr(args, "max_optimizer_steps", None) is not None and global_step >= int(
+            args.max_optimizer_steps
+        ):
+            if logger is not None:
+                logger.info(
+                    f"Reached max_optimizer_steps={int(args.max_optimizer_steps)} at epoch {epoch}"
+                )
+            break
 
         # eval ema
         if args.use_ema:

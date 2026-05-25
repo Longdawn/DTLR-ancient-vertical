@@ -43,8 +43,6 @@ from .utils import sigmoid_focal_loss, MLP
 from ..registry import MODULE_BUILD_FUNCS
 from .dn_components import prepare_for_cdn, dn_post_process
 
-torch.cuda.set_device(0)
-
 
 class DINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
@@ -310,7 +308,7 @@ class DINO(nn.Module):
                 masks.append(mask)
                 poss.append(pos_l)
 
-        if self.dn_number > 0 or targets is not None:
+        if self.dn_number > 0 and targets is not None:
             input_query_label, input_query_bbox, attn_mask, dn_meta = prepare_for_cdn(
                 dn_args=(
                     targets,
@@ -325,7 +323,6 @@ class DINO(nn.Module):
                 label_enc=self.label_enc,
             )
         else:
-            assert targets is None
             input_query_bbox = input_query_label = attn_mask = dn_meta = None
 
         hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(

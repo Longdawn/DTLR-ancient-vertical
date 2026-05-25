@@ -43,8 +43,6 @@ from .utils import sigmoid_focal_loss, MLP
 from ..registry import MODULE_BUILD_FUNCS
 from .dn_components import prepare_for_cdn, dn_post_process
 
-torch.cuda.set_device(0)
-
 
 class DINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
@@ -75,6 +73,7 @@ class DINO(nn.Module):
         dn_box_noise_scale=0.4,
         dn_label_noise_ratio=0.5,
         dn_labelbook_size=100,
+        use_direction_head=False,
     ):
         """Initializes the model.
         Parameters:
@@ -97,6 +96,7 @@ class DINO(nn.Module):
         self.num_feature_levels = num_feature_levels
         self.nheads = nheads
         self.label_enc = nn.Embedding(dn_labelbook_size + 1, hidden_dim)
+        self.use_direction_head = use_direction_head
 
         # setting query dim
         self.query_dim = query_dim
@@ -226,6 +226,8 @@ class DINO(nn.Module):
             self.label_embedding = None
 
         self._reset_parameters()
+        if self.use_direction_head:
+            self.direction_embed = nn.Linear(hidden_dim, 2)
 
     def _reset_parameters(self):
         # init input_proj
@@ -310,7 +312,7 @@ class DINO(nn.Module):
                 masks.append(mask)
                 poss.append(pos_l)
 
-        if self.dn_number > 0 or targets is not None:
+        if self.dn_number > 0 and targets is not None:
             input_query_label, input_query_bbox, attn_mask, dn_meta = prepare_for_cdn(
                 dn_args=(
                     targets,
@@ -325,7 +327,6 @@ class DINO(nn.Module):
                 label_enc=self.label_enc,
             )
         else:
-            assert targets is None
             input_query_bbox = input_query_label = attn_mask = dn_meta = None
 
         hs, reference, hs_enc, ref_enc, init_box_proposal = self.transformer(
@@ -361,6 +362,8 @@ class DINO(nn.Module):
                 self._set_aux_loss,
             )
         out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        if self.use_direction_head:
+            out["pred_direction"] = self.direction_embed(hs[-1].mean(dim=1))
         if self.aux_loss:
             out["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord_list)
 
@@ -433,7 +436,19 @@ class SetCriterion(nn.Module):
     """
 
     def __init__(
-        self, num_classes, matcher, weight_dict, focal_alpha, losses, CTC=False
+        self,
+        num_classes,
+        matcher,
+        weight_dict,
+        focal_alpha,
+        losses,
+        CTC=False,
+        ctc_blank_max=1.0,
+        ctc_count_loss_short_weight=1.0,
+        short_gt_presence_max_len=0,
+        short_gt_presence_margin=0.0,
+        short_gt_ce_max_len=0,
+        short_gt_ce_gamma=0.0,
     ):
         """Create the criterion.
         Parameters:
@@ -450,9 +465,56 @@ class SetCriterion(nn.Module):
         self.losses = losses
         self.focal_alpha = focal_alpha
         self.CTC = CTC
+        self.ctc_blank_max = float(ctc_blank_max)
+        self.ctc_count_loss_short_weight = float(ctc_count_loss_short_weight)
+        self.short_gt_presence_max_len = int(short_gt_presence_max_len)
+        self.short_gt_presence_margin = float(short_gt_presence_margin)
+        self.short_gt_ce_max_len = int(short_gt_ce_max_len)
+        self.short_gt_ce_gamma = float(short_gt_ce_gamma)
+        self.direction_loss_enabled = "loss_direction" in self.weight_dict
+        self.ctc_count_loss_enabled = "loss_ctc_count" in self.weight_dict
+        self.short_gt_presence_enabled = "loss_short_gt_presence" in self.weight_dict
+        self.short_gt_ce_enabled = "loss_short_gt_ce" in self.weight_dict
         if self.CTC:
             self.losses_all = copy.deepcopy(self.losses)
             self.losses_CTC = ["loss_CTC"]
+
+    def _extract_direction_target(self, target_item):
+        if not isinstance(target_item, dict) or "direction" not in target_item:
+            return None
+        direction = target_item["direction"]
+        if torch.is_tensor(direction):
+            direction = int(direction.item())
+        return 1 if int(direction) == 1 else 0
+
+    def loss_direction(self, outputs, targets, indices, num_boxes, log=True):
+        if "pred_direction" not in outputs:
+            zero = outputs["pred_logits"].sum() * 0.0
+            return {"loss_direction": zero, "direction_acc": zero}
+
+        valid_indices = []
+        direction_targets = []
+        for idx, target in enumerate(targets):
+            direction = self._extract_direction_target(target)
+            if direction is None:
+                continue
+            valid_indices.append(idx)
+            direction_targets.append(direction)
+
+        if len(valid_indices) == 0:
+            zero = outputs["pred_direction"].sum() * 0.0
+            return {"loss_direction": zero, "direction_acc": zero}
+
+        valid_indices = torch.as_tensor(
+            valid_indices, device=outputs["pred_direction"].device, dtype=torch.long
+        )
+        direction_targets = torch.as_tensor(
+            direction_targets, device=outputs["pred_direction"].device, dtype=torch.long
+        )
+        pred_direction = outputs["pred_direction"].index_select(0, valid_indices)
+        loss_direction = F.cross_entropy(pred_direction, direction_targets)
+        direction_acc = (pred_direction.argmax(-1) == direction_targets).float().mean()
+        return {"loss_direction": loss_direction, "direction_acc": direction_acc}
 
     def loss_CTC(
         self,
@@ -463,13 +525,30 @@ class SetCriterion(nn.Module):
         log=True,
         return_preds=False
     ):
+        def _get_direction(target_item):
+            if isinstance(target_item, dict) and "direction" in target_item:
+                direction = target_item["direction"]
+                if torch.is_tensor(direction):
+                    direction = int(direction.item())
+                else:
+                    direction = int(direction)
+                return "vertical" if direction == 1 else "horizontal"
+            return "horizontal"
+
         pred_logits = outputs["pred_logits"]
         device = pred_logits.device
         
         pred_logits_topk = pred_logits
         pred_boxes_topk = outputs["pred_boxes"]
 
-        __, idx = torch.sort(pred_boxes_topk[:, :, 0])
+        # Sort each sample with its own reading direction.
+        idx_list = []
+        for i in range(pred_boxes_topk.shape[0]):
+            direction = _get_direction(targets[i])
+            sort_axis = 1 if direction == "vertical" else 0
+            __, idx_i = torch.sort(pred_boxes_topk[i, :, sort_axis], descending=False)
+            idx_list.append(idx_i)
+        idx = torch.stack(idx_list, dim=0)
 
         sorted_by_x_pred_logits = torch.gather(
             pred_logits_topk,
@@ -500,6 +579,20 @@ class SetCriterion(nn.Module):
             * sorted_by_x_pred_logits[mask]
             / sorted_by_x_pred_logits[mask].sum(-1).unsqueeze(-1)
         )
+
+        # Optional anti-collapse control: cap blank probability so decode is less
+        # likely to become empty on vertical long lines.
+        if 0.0 < self.ctc_blank_max < 1.0:
+            blank_probs = new_pred_logits[:, :, 0]
+            over_mask = blank_probs > self.ctc_blank_max
+            if over_mask.any():
+                nonblank_sum = new_pred_logits[:, :, 1:].sum(-1).clamp(min=1e-6)
+                scale = (1.0 - self.ctc_blank_max) / nonblank_sum
+                new_pred_logits[:, :, 1:][over_mask] = (
+                    new_pred_logits[:, :, 1:][over_mask]
+                    * scale[over_mask].unsqueeze(-1)
+                )
+                new_pred_logits[:, :, 0][over_mask] = self.ctc_blank_max
         
         
         blank_tensor = torch.zeros_like(new_pred_logits) + 1e-5
@@ -544,7 +637,85 @@ class SetCriterion(nn.Module):
         )  
     
 
-        losses = {"loss_CTC": loss}
+        blank_pred_ratio = (new_pred_logits.argmax(-1) == 0).float().mean()
+        losses = {"loss_CTC": loss, "blank_pred_ratio": blank_pred_ratio.detach()}
+
+        if self.ctc_count_loss_enabled:
+            target_count = length_input.float().to(device).clamp(min=1.0)
+            expected_nonblank_count = new_pred_logits[:, :, 1:].sum(-1).sum(-1)
+            count_ratio = expected_nonblank_count / target_count
+            count_target = torch.ones_like(count_ratio)
+            count_loss = F.smooth_l1_loss(count_ratio, count_target, reduction="none")
+
+            if self.ctc_count_loss_short_weight > 1.0:
+                short_mask = target_count <= 2.0
+                weights = torch.ones_like(count_loss)
+                weights[short_mask] = self.ctc_count_loss_short_weight
+                count_loss = count_loss * weights
+
+            losses["loss_ctc_count"] = count_loss.mean()
+            losses["ctc_expected_count"] = expected_nonblank_count.detach().mean()
+            losses["ctc_target_count"] = target_count.detach().mean()
+
+        if self.short_gt_presence_enabled:
+            presence_losses = []
+            log_blank = torch.log(new_pred_logits[:, :, 0].clamp(min=1e-8))
+            log_nonblank = torch.log(new_pred_logits[:, :, 1:].clamp(min=1e-8))
+            for batch_idx, target in enumerate(targets):
+                labels = target["labels"].long().to(device)
+                if labels.numel() == 0:
+                    continue
+                if self.short_gt_presence_max_len > 0 and labels.numel() > self.short_gt_presence_max_len:
+                    continue
+                for label in labels:
+                    # For each required character, at least one query should make
+                    # that character beat blank. This targets short-sample
+                    # empty/deletion failures more directly than expected-count.
+                    margin_scores = log_nonblank[batch_idx, :, label] - log_blank[batch_idx]
+                    best_margin = margin_scores.max()
+                    presence_losses.append(F.softplus(self.short_gt_presence_margin - best_margin))
+
+            if presence_losses:
+                losses["loss_short_gt_presence"] = torch.stack(presence_losses).mean()
+            else:
+                losses["loss_short_gt_presence"] = loss * 0.0
+
+        if self.short_gt_ce_enabled:
+            ce_losses = []
+            char_probs = new_pred_logits[:, :, 1:].clamp(min=1e-8)
+            for batch_idx, target in enumerate(targets):
+                labels = target["labels"].long().to(device)
+                if labels.numel() == 0:
+                    continue
+                if self.short_gt_ce_max_len > 0 and labels.numel() > self.short_gt_ce_max_len:
+                    continue
+
+                used_queries = torch.zeros(
+                    char_probs.shape[1],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                for label in labels:
+                    scores = char_probs[batch_idx, :, label].detach().clone()
+                    if used_queries.all():
+                        used_queries.zero_()
+                    scores[used_queries] = -1.0
+                    query_idx = scores.argmax()
+                    used_queries[query_idx] = True
+
+                    prob = char_probs[batch_idx, query_idx, label]
+                    nll = -torch.log(prob)
+                    if self.short_gt_ce_gamma > 0:
+                        nll = ((1.0 - prob).detach() ** self.short_gt_ce_gamma) * nll
+                    ce_losses.append(nll)
+
+            if ce_losses:
+                losses["loss_short_gt_ce"] = torch.stack(ce_losses).mean()
+            else:
+                losses["loss_short_gt_ce"] = loss * 0.0
+
+        if self.direction_loss_enabled:
+            losses.update(self.loss_direction(outputs, targets, indices, num_boxes))
         if return_preds:
             return losses, new_pred_logits, None
 
@@ -705,6 +876,7 @@ class SetCriterion(nn.Module):
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
             "loss_CTC": self.loss_CTC,
+            "direction": self.loss_direction,
         }
 
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
@@ -1113,6 +1285,7 @@ def build_dino(args):
         dn_box_noise_scale=args.dn_box_noise_scale,
         dn_label_noise_ratio=args.dn_label_noise_ratio,
         dn_labelbook_size=dn_labelbook_size,
+        use_direction_head=getattr(args, "use_direction_head", False),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -1166,7 +1339,24 @@ def build_dino(args):
         )
         weight_dict.update(interm_weight_dict)
 
+    # CTC/direction losses belong to the line-recognition path only, so keep them
+    # out of the DETR aux/intermediate weight construction above.
+    weight_dict["loss_CTC"] = args.CTC_loss_coef
+    ctc_count_loss_coef = getattr(args, "ctc_count_loss_coef", 0.0)
+    if ctc_count_loss_coef > 0:
+        weight_dict["loss_ctc_count"] = ctc_count_loss_coef
+    short_gt_presence_loss_coef = getattr(args, "short_gt_presence_loss_coef", 0.0)
+    if short_gt_presence_loss_coef > 0:
+        weight_dict["loss_short_gt_presence"] = short_gt_presence_loss_coef
+    short_gt_ce_loss_coef = getattr(args, "short_gt_ce_loss_coef", 0.0)
+    if short_gt_ce_loss_coef > 0:
+        weight_dict["loss_short_gt_ce"] = short_gt_ce_loss_coef
+    if getattr(args, "use_direction_head", False):
+        weight_dict["loss_direction"] = getattr(args, "direction_loss_coef", 1.0)
+
     losses = ["labels", "boxes", "cardinality"]
+    if getattr(args, "use_direction_head", False):
+        losses.append("direction")
     if args.masks:
         losses += ["masks"]
 
@@ -1175,7 +1365,13 @@ def build_dino(args):
         matcher=matcher,
         weight_dict=weight_dict,
         focal_alpha=args.focal_alpha,
-        losses=losses
+        losses=losses,
+        ctc_blank_max=getattr(args, "ctc_blank_max", 1.0),
+        ctc_count_loss_short_weight=getattr(args, "ctc_count_loss_short_weight", 1.0),
+        short_gt_presence_max_len=getattr(args, "short_gt_presence_max_len", 0),
+        short_gt_presence_margin=getattr(args, "short_gt_presence_margin", 0.0),
+        short_gt_ce_max_len=getattr(args, "short_gt_ce_max_len", 0),
+        short_gt_ce_gamma=getattr(args, "short_gt_ce_gamma", 0.0),
     )
     criterion.to(device)
     postprocessors = {

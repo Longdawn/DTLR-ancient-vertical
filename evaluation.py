@@ -25,6 +25,8 @@ parser.add_argument("--config", type=str, default="config/Latin_CTC.py")
 parser.add_argument("--fix_enc_out_class", action="store_true")
 parser.add_argument("--TH", type=float, default=None)
 parser.add_argument("--NMS", type=float, default=None)
+parser.add_argument("--text_direction", type=str, default="auto", choices=["auto", "horizontal", "vertical"])
+parser.add_argument("--decode_by_pred_direction", action="store_true")
 args = parser.parse_args()
 
 model_config_path = args.config
@@ -51,9 +53,22 @@ else:
 def load_model(model):
     device = args_dataset.device
 
+    def _load_compatible_weights(model_obj, ckpt_model):
+        model_state = model_obj.state_dict()
+        filtered = {}
+        skipped = []
+        for k, v in ckpt_model.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                skipped.append(k)
+        model_obj.load_state_dict(filtered, strict=False)
+        if len(skipped) > 0:
+            print(f"Skipped {len(skipped)} incompatible params (e.g. classification head).")
+
     if not args.new_class_embedding:
         checkpoint = torch.load(args.weights, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
+        _load_compatible_weights(model, checkpoint["model"])
         model.eval()
         model.to(device)
         return model
@@ -85,12 +100,44 @@ def load_model(model):
     if args.new_label_enc:
         model.label_enc = nn.Embedding(len(dataset_val.charset)+1,features_dim ).to(device)
     checkpoint = torch.load(args.weights, map_location="cpu")
-    model.load_state_dict(checkpoint["model"])
+    _load_compatible_weights(model, checkpoint["model"])
     model.eval()
     model.to(device)
 
+
+def _get_text_direction(targets):
+    if args.decode_by_pred_direction:
+        return None
+    if args.text_direction in ["horizontal", "vertical"]:
+        return args.text_direction
+    if len(targets) > 0 and isinstance(targets[0], dict) and "direction" in targets[0]:
+        direction = targets[0]["direction"]
+        if torch.is_tensor(direction):
+            direction = int(direction.item())
+        else:
+            direction = int(direction)
+        return "vertical" if direction == 1 else "horizontal"
+    return "horizontal"
+
+
+def _sort_boxes_by_direction(boxes, direction):
+    """
+    Sort boxes according to reading direction.
+    
+    For horizontal: left-to-right (x-axis ascending)
+    For vertical single-column: top-to-bottom (y-axis ascending)
+    """
+    axis = 1 if direction == "vertical" else 0  # 竖排按y(axis 1), 横排按x(axis 0)
+    descending = False
+    return torch.sort(boxes[:, axis], descending=descending)[1]
+
 @torch.no_grad()
 def convert_output_to_pred(outputs, targets, charset, TH=None, NM=None):
+    direction = _get_text_direction(targets)
+    if direction is None and "pred_direction" in outputs:
+        direction = "vertical" if int(outputs["pred_direction"].argmax(-1)[0].item()) == 1 else "horizontal"
+    elif direction is None:
+        direction = "horizontal"
     if args.NMS_inference: 
         output = outputs
 
@@ -105,7 +152,7 @@ def convert_output_to_pred(outputs, targets, charset, TH=None, NM=None):
         boxes = box_ops.box_xyxy_to_cxcywh(output["boxes"])
 
         select_mask = scores > thershold
-        sorted_box = torch.sort(boxes[select_mask][:,0], descending=False)[1]
+        sorted_box = _sort_boxes_by_direction(boxes[select_mask], direction)
         
         labels = labels.long()
         items = labels[select_mask][sorted_box]
@@ -119,7 +166,10 @@ def convert_output_to_pred(outputs, targets, charset, TH=None, NM=None):
         pred_logits_topk = pred_logits
 
         pred_boxes_topk = outputs["pred_boxes"]
-        __, idx = torch.sort(pred_boxes_topk[:, :, 0])
+        
+        # Sort boxes according to reading direction
+        sort_axis = 1 if direction == "vertical" else 0  # 竖排按y, 横排按x
+        __, idx = torch.sort(pred_boxes_topk[:, :, sort_axis])
 
         sorted_by_x_pred_logits = torch.gather(
             pred_logits_topk,
@@ -158,6 +208,17 @@ def convert_output_to_pred(outputs, targets, charset, TH=None, NM=None):
         preds_labels = [i.item() - 1 for i in pred_seq]
 
     return preds, preds_labels  
+
+
+def _labels_to_text(label_ids, charset):
+    chars = []
+    for item in label_ids:
+        value = charset[int(item)]
+        if isinstance(value, str):
+            chars.append(value)
+        else:
+            chars.append(chr(int(value)))
+    return "".join(chars)
 
 
 @torch.no_grad()
@@ -398,10 +459,14 @@ def word_error_rate(predicted_words, gt_words):
 
 @torch.no_grad()
 def split_labels_into_words(labels, charset):
+    if " " not in charset:
+        return [list(labels)] if len(labels) > 0 else []
+
     words = []
     word = []
+    space_idx = charset.index(" ")
     for label in labels:
-        if label == charset.index(" "):
+        if label == space_idx:
             if word:
                 words.append(word)
                 word = []
@@ -504,20 +569,21 @@ if __name__ == "__main__":
                         continue
                     cer_it, dict_char, div, predicted_labels = compute_cer_impact(output, [targets], dataset_val.charset, dict_char, TH=TH, NM=NM)
                     if args.unicode:
-                        list_preds_str.append("".join( [chr(dataset_val.charset[int(item)]) for item in predicted_labels]) )
-                        list_gt_str.append("".join([chr(dataset_val.charset[int(item)]) for item in targets['labels']]))
+                        list_preds_str.append(_labels_to_text(predicted_labels, dataset_val.charset))
+                        list_gt_str.append(_labels_to_text(targets['labels'], dataset_val.charset))
                     else:
                         if args.dataset in [ "IAM", "RIMES", "READ"]:
-                            preds_str = "".join([dataset_val.charset[int(item)]for item in predicted_labels])
-                            gt_str = "".join([dataset_val.charset[int(item)]for item in targets['labels']])
+                            preds_str = _labels_to_text(predicted_labels, dataset_val.charset)
+                            gt_str = _labels_to_text(targets['labels'], dataset_val.charset)
                             list_preds_str.append(preds_str)
                             list_gt_str.append(gt_str)
                         else:
-                            list_preds_str.append("".join([dataset_val.charset[int(item)]for item in predicted_labels]))
-                            list_gt_str.append("".join([dataset_val.charset[int(item)]for item in targets['labels']]))
+                            list_preds_str.append(_labels_to_text(predicted_labels, dataset_val.charset))
+                            list_gt_str.append(_labels_to_text(targets['labels'], dataset_val.charset))
                     
                     dist_txt = editdistance.eval(list_gt_str[-1], list_preds_str[-1])
-                    cer_txt = dist_txt / len(list_gt_str[-1])
+                    cer_txt = dist_txt / max(len(list_gt_str[-1]), 1)
+                    CER_txt.append(cer_txt)
                     if args.dataset in [ "IAM", "RIMES", "READ"]:
                         process_gt = process_pred_string(list_gt_str[-1])
                         process_pred = process_pred_string(list_preds_str[-1])

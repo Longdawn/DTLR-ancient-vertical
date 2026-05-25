@@ -19,6 +19,90 @@ from util.visualizer import COCOVisualizer
 from util import box_ops
 vslzr = COCOVisualizer()
 
+
+def _get_scheduler_lrs(lr_scheduler, optimizer):
+    if lr_scheduler is not None and hasattr(lr_scheduler, "get_last_lr"):
+        try:
+            return lr_scheduler.get_last_lr()
+        except Exception:
+            pass
+    return [group["lr"] for group in optimizer.param_groups]
+
+
+def _apply_manual_step_lr(optimizer, step_schedule, global_step):
+    if not step_schedule:
+        return
+
+    target_lr = None
+    for step_boundary, step_lr in step_schedule:
+        if global_step >= int(step_boundary):
+            target_lr = float(step_lr)
+        else:
+            break
+
+    if target_lr is None:
+        return
+
+    for group in optimizer.param_groups:
+        group["lr"] = target_lr
+
+
+def _direction_to_label(direction_value):
+    if torch.is_tensor(direction_value):
+        direction_value = int(direction_value.item())
+    return "vertical" if int(direction_value) == 1 else "horizontal"
+
+
+def _get_target_direction(target_item):
+    if isinstance(target_item, dict) and "direction" in target_item:
+        return _direction_to_label(target_item["direction"])
+    return "horizontal"
+
+
+def _get_decode_directions(outputs, targets, decode_by_pred_direction=False):
+    if decode_by_pred_direction and "pred_direction" in outputs:
+        return [
+            _direction_to_label(item)
+            for item in outputs["pred_direction"].argmax(-1)
+        ]
+    return [_get_target_direction(target) for target in targets]
+
+
+def _sort_pred_logits_by_direction(pred_logits, pred_boxes, directions):
+    idx_list = []
+    for i, direction in enumerate(directions):
+        sort_axis = 1 if direction == "vertical" else 0
+        _, idx_i = torch.sort(pred_boxes[i, :, sort_axis], descending=False)
+        idx_list.append(idx_i)
+
+    idx = torch.stack(idx_list, dim=0)
+    return torch.gather(
+        pred_logits,
+        1,
+        idx.unsqueeze(-1).expand(-1, -1, pred_logits.shape[-1]),
+    )
+
+
+def _compute_direction_accuracy(outputs, targets):
+    if "pred_direction" not in outputs:
+        return None
+
+    target_directions = []
+    valid_indices = []
+    for idx, target in enumerate(targets):
+        if isinstance(target, dict) and "direction" in target:
+            valid_indices.append(idx)
+            target_directions.append(1 if _get_target_direction(target) == "vertical" else 0)
+
+    if len(valid_indices) == 0:
+        return None
+
+    pred = outputs["pred_direction"].argmax(-1).detach().cpu()
+    correct = 0
+    for idx, target_direction in zip(valid_indices, target_directions):
+        correct += int(pred[idx].item() == target_direction)
+    return correct / len(valid_indices)
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, 
@@ -172,7 +256,8 @@ def add_prefix_to_keys(dictionary, prefix):
 def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, 
-                    wo_class_error=False, lr_scheduler=None, args=None, logger=None, ema_m=None,run = None):
+                    wo_class_error=False, lr_scheduler=None, args=None, logger=None, ema_m=None,run = None,
+                    global_step_start=0, step_callback=None):
 
     model.train()
    # criterion.train()
@@ -187,10 +272,16 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
     old_wer = 0
     old_cer = 0
     iterations = 0
+    global_step = int(global_step_start)
     it_loader = 0
     it_CER = 0 
+    skipped_batches = 0
+    max_skipped_batches = getattr(args, "max_skipped_batches", 200)
+    step_lr_schedule = getattr(args, "step_lr_schedule", [])
+    max_optimizer_steps = getattr(args, "max_optimizer_steps", None)
     for samples, targets in metric_logger.log_every(data_loader, print_freq, header, logger=logger): ## to modify
         try:
+            _apply_manual_step_lr(optimizer, step_lr_schedule, global_step)
             samples = samples.to(device)
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
          
@@ -198,8 +289,12 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
                 outputs = model(samples, targets)
             
             loss_dict, preds, new_preds= criterion.loss_CTC(outputs, targets,None,None, return_preds = True)
-
-            loss = sum(loss_dict[k] for k in loss_dict.keys())
+            weight_dict = criterion.weight_dict
+            loss = sum(
+                loss_dict[k] * weight_dict[k]
+                for k in loss_dict.keys()
+                if k in weight_dict
+            )
 
             loss_value = loss.item()
             loss_dict_wandb = {}
@@ -207,22 +302,41 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
             for key, value in loss_dict.items():
                 loss_dict_wandb["train_" + key] = value
             
-            run.log(loss_dict_wandb)
+            if run is not None:
+                run.log(loss_dict_wandb)
 
-            loss_dict_reduced_scaled = {"loss_scaled": loss_value}
-            loss_dict_unscaled = {"loss_unscaled": loss_value}
+            loss_dict_reduced_scaled = {
+                k: v * weight_dict[k] for k, v in loss_dict.items() if k in weight_dict
+            }
+            loss_dict_unscaled = {
+                f"{k}_unscaled": v for k, v in loss_dict.items() if k in weight_dict
+            }
 
             
-            run.log({'global_step': iterations+(min(len(data_loader),args.max_iterations) * epoch)})
+            if run is not None:
+                run.log({'global_step': global_step})
             if it_loader % 100 == 99:
         
                 batch_size = outputs["pred_logits"].shape[0]
                 it_CER += 1
-                wer_it, cer_it = compute_wer(outputs,targets,args.charset, preds,mode_chr =args.mode_chr)
+                wer_it, cer_it = compute_wer(
+                    outputs,
+                    targets,
+                    args.charset,
+                    preds,
+                    mode_chr=args.mode_chr,
+                    decode_by_pred_direction=getattr(args, "decode_by_pred_direction", False),
+                    preds_already_sorted=True,
+                )
                 old_wer += wer_it / batch_size
                 old_cer += cer_it / batch_size
-                run.log({"train_wer":old_wer/it_CER})
-                run.log({"train_cer":old_cer/it_CER})
+                if run is not None:
+                    run.log({"train_wer":old_wer/it_CER})
+                    run.log({"train_cer":old_cer/it_CER})
+                direction_acc = _compute_direction_accuracy(outputs, targets)
+                if direction_acc is not None:
+                    if run is not None:
+                        run.log({"train_direction_acc": direction_acc})
             it_loader +=1
             
 
@@ -243,8 +357,22 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
             if args.onecyclelr:
                 lr_scheduler.step()
 
+            global_step += 1
+            if step_callback is not None:
+                callback_result = step_callback(global_step)
+                if callback_result is not None:
+                    if (
+                        isinstance(callback_result, tuple)
+                        and len(callback_result) == 2
+                    ):
+                        optimizer, lr_scheduler = callback_result
+                    else:
+                        optimizer = callback_result
+
 
             metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_unscaled)
+            if "direction_acc" in loss_dict:
+                metric_logger.update(direction_acc=loss_dict["direction_acc"].item())
 
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
@@ -253,10 +381,66 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
                 if _cnt % 15 == 0:
                     print("BREAK!"*5)
                     break 
-        except:
+        except Exception as e:
+            skipped_batches += 1
+            batch_shapes = None
+            batch_target_info = []
+            try:
+                if hasattr(samples, "tensors"):
+                    batch_shapes = tuple(samples.tensors.shape)
+                elif torch.is_tensor(samples):
+                    batch_shapes = tuple(samples.shape)
+            except Exception:
+                batch_shapes = "unavailable"
+
+            try:
+                for t in targets:
+                    info = {}
+                    for key in ["image_id", "size", "orig_size", "direction", "labels"]:
+                        if key not in t:
+                            continue
+                        value = t[key]
+                        if torch.is_tensor(value):
+                            if value.numel() == 1:
+                                info[key] = value.item()
+                            elif key == "labels":
+                                info[key] = {
+                                    "shape": tuple(value.shape),
+                                    "min": value.min().item() if value.numel() > 0 else None,
+                                    "max": value.max().item() if value.numel() > 0 else None,
+                                }
+                            else:
+                                info[key] = tuple(value.detach().cpu().tolist())
+                        else:
+                            info[key] = value
+                    info["keys"] = sorted(list(t.keys()))
+                    batch_target_info.append(info)
+            except Exception:
+                batch_target_info = ["failed_to_collect_target_info"]
+
+            if logger is not None:
+                logger.warning(f"[train_one_epoch_CTC] skipped one batch due to: {e}")
+                logger.warning(
+                    f"[train_one_epoch_CTC] batch_shapes={batch_shapes} batch_target_info={batch_target_info}"
+                )
+                logger.warning(
+                    f"[train_one_epoch_CTC] skipped_batches={skipped_batches}/{max_skipped_batches}"
+                )
+            else:
+                print(f"[train_one_epoch_CTC] skipped one batch due to: {e}")
+                print(
+                    f"[train_one_epoch_CTC] batch_shapes={batch_shapes} batch_target_info={batch_target_info}"
+                )
+            if skipped_batches >= max_skipped_batches:
+                raise RuntimeError(
+                    f"Too many skipped batches: {skipped_batches}. "
+                    "Stop training to avoid silent failure."
+                )
             continue
     
         iterations += len(targets)
+        if max_optimizer_steps is not None and global_step >= int(max_optimizer_steps):
+            break
         if  iterations >= args.max_iterations:
             break
 
@@ -270,8 +454,9 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
     if getattr(criterion, 'loss_weight_decay', False):
         resstat.update({f'weight_{k}': v for k,v in criterion.weight_dict.items()})
 
-    run.log({'lr_scheduler': lr_scheduler.get_last_lr()})
-    return resstat
+    if run is not None:
+        run.log({'lr_scheduler': _get_scheduler_lrs(lr_scheduler, optimizer)})
+    return resstat, global_step
 
 
 @torch.no_grad()
@@ -364,6 +549,11 @@ def evaluate_CTC(model, criterion, postprocessors, data_loader, base_ds, device,
 
     old_cer = 0
     old_wer = 0
+    pred_old_cer = 0
+    pred_old_wer = 0
+    has_pred_direction_metrics = False
+    direction_acc_sum = 0
+    direction_acc_batches = 0
     iterations = 0
     predicted_str_total = []
     idx_list = []
@@ -385,7 +575,8 @@ def evaluate_CTC(model, criterion, postprocessors, data_loader, base_ds, device,
         for key, value in loss_dict.items():
             loss_dict_wandb["test_" + key] = value
         
-        run.log(loss_dict_wandb)
+        if run is not None:
+            run.log(loss_dict_wandb)
 
         weight_dict = criterion.weight_dict
 
@@ -401,6 +592,8 @@ def evaluate_CTC(model, criterion, postprocessors, data_loader, base_ds, device,
                              **loss_dict_reduced_unscaled)
         if 'class_error' in loss_dict_reduced:
             metric_logger.update(class_error=loss_dict_reduced['class_error'])
+        if "direction_acc" in loss_dict:
+            metric_logger.update(direction_acc=loss_dict["direction_acc"].item())
 
         if iterations == 0:
             try:
@@ -408,10 +601,37 @@ def evaluate_CTC(model, criterion, postprocessors, data_loader, base_ds, device,
             except:
                 pass
         
-        wer_it, cer_it, predicted_str_total_it = compute_wer(outputs,targets,args.charset, preds, return_preds = True, mode_chr =mode_chr)
-        old_wer += wer_it
-        old_cer += cer_it
-    
+        wer_it_oracle, cer_it_oracle, predicted_str_total_it = compute_wer(
+            outputs,
+            targets,
+            args.charset,
+            preds,
+            return_preds=True,
+            mode_chr=mode_chr,
+            decode_by_pred_direction=False,
+            preds_already_sorted=True,
+        )
+        old_wer += wer_it_oracle
+        old_cer += cer_it_oracle
+
+        if "pred_direction" in outputs:
+            has_pred_direction_metrics = True
+            pred_wer, pred_cer = compute_wer(
+                outputs,
+                targets,
+                args.charset,
+                preds,
+                mode_chr=mode_chr,
+                decode_by_pred_direction=True,
+                preds_already_sorted=True,
+            )
+            pred_old_wer += pred_wer
+            pred_old_cer += pred_cer
+            direction_acc = _compute_direction_accuracy(outputs, targets)
+            if direction_acc is not None:
+                direction_acc_sum += direction_acc
+                direction_acc_batches += 1
+
         iterations += len(targets)
         for i in range(len(predicted_str_total_it)):
             predicted_str_total.append(predicted_str_total_it[i])
@@ -419,9 +639,24 @@ def evaluate_CTC(model, criterion, postprocessors, data_loader, base_ds, device,
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    run.log({"test_wer":old_wer/iterations})
-    run.log({"test_cer":old_cer/iterations})
+    if run is not None:
+        run.log({"test_wer_oracle_direction":old_wer/iterations})
+        run.log({"test_cer_oracle_direction":old_cer/iterations})
+    if has_pred_direction_metrics:
+        if run is not None:
+            run.log({"test_wer_pred_direction":pred_old_wer/iterations})
+            run.log({"test_cer_pred_direction":pred_old_cer/iterations})
+    if direction_acc_batches > 0:
+        if run is not None:
+            run.log({"test_direction_acc": direction_acc_sum / direction_acc_batches})
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
+    stats["wer_oracle_direction"] = old_wer / iterations
+    stats["cer_oracle_direction"] = old_cer / iterations
+    if has_pred_direction_metrics:
+        stats["wer_pred_direction"] = pred_old_wer / iterations
+        stats["cer_pred_direction"] = pred_old_cer / iterations
+    if direction_acc_batches > 0:
+        stats["direction_acc"] = direction_acc_sum / direction_acc_batches
 
     return stats, None
 
@@ -509,7 +744,7 @@ def edit_wer_from_formatted_split_text(gt, pred):
     return editdistance.eval(gt, pred)
 
 @torch.no_grad()
-def convert_output_to_pred(outputs,charset, new_pred_logits):
+def convert_output_to_pred(outputs,charset, new_pred_logits, direction="horizontal"):
 
     # pred =  new_pred_logits.max(-1)[1]
     # preds = []
@@ -523,10 +758,12 @@ def convert_output_to_pred(outputs,charset, new_pred_logits):
     pred = new_pred_logits.argmax(-1)
     preds = []
     preds_labels = []
+    max_token = len(charset)
     for i in range(pred.shape[0]):
-        pred_seq = pred[i][pred[i].nonzero()]
-        preds.append([charset[i-1] for i in pred_seq])
-        preds_labels.append([ i-1 for i in pred_seq])
+        ctc_seq = remove_duplicates(pred[i].tolist())
+        valid_tokens = [token for token in ctc_seq if 1 <= token <= max_token]
+        preds.append([charset[token - 1] for token in valid_tokens])
+        preds_labels.append([token - 1 for token in valid_tokens])
     return preds,preds_labels
 @torch.no_grad()
 def remove_duplicates(sequence):
@@ -541,12 +778,40 @@ def remove_duplicates(sequence):
 
     return processed_output
 @torch.no_grad()
-def compute_wer(outputs,targets,charset, preds,return_preds = False,duplicate = False,mode_chr = False):
+def compute_wer(
+    outputs,
+    targets,
+    charset,
+    preds,
+    return_preds=False,
+    duplicate=False,
+    mode_chr=False,
+    decode_by_pred_direction=False,
+    preds_already_sorted=True,
+):
     N_batch = outputs["pred_logits"].shape[0]
     wer = 0
     cer = 0
+    max_token = len(charset)
+
     if not duplicate:
-        predicted_str_total,predicted_labels_total = convert_output_to_pred(outputs,charset, preds)
+        predicted_str_total,predicted_labels_total = [], []
+        pred_logits = preds if torch.is_tensor(preds) else torch.stack(preds, dim=0)
+        if preds_already_sorted:
+            sorted_by_pred_logits = pred_logits
+        else:
+            directions = _get_decode_directions(
+                outputs, targets, decode_by_pred_direction=decode_by_pred_direction
+            )
+            sorted_by_pred_logits = _sort_pred_logits_by_direction(
+                pred_logits, outputs["pred_boxes"], directions
+            )
+        pred = sorted_by_pred_logits.argmax(-1)
+        for i in range(N_batch):
+            ctc_seq = remove_duplicates(pred[i].tolist())
+            valid_tokens = [token for token in ctc_seq if 1 <= token <= max_token]
+            predicted_labels_total.append([token - 1 for token in valid_tokens])
+            predicted_str_total.append([charset[token - 1] for token in valid_tokens])
     else:
         preds = preds.argmax(-1)
         predicted_str_total = []

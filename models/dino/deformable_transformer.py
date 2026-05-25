@@ -340,7 +340,7 @@ class DeformableTransformer(nn.Module):
 
             enc_outputs_class_unselected = self.enc_out_class_embed(output_memory)
             enc_outputs_coord_unselected = self.enc_out_bbox_embed(output_memory) + output_proposals # (bs, \sum{hw}, 4) unsigmoid
-            topk = self.num_queries
+            topk = min(self.num_queries, enc_outputs_class_unselected.shape[1])
 
             topk_proposals = torch.topk(enc_outputs_class_unselected.max(-1)[0], topk, dim=1)[1] # bs, nq
 
@@ -352,7 +352,7 @@ class DeformableTransformer(nn.Module):
             # gather tgt
             tgt_undetach = torch.gather(output_memory, 1, topk_proposals.unsqueeze(-1).repeat(1, 1, self.d_model))
             if self.embed_init_tgt:
-                tgt_ = self.tgt_embed.weight[:, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
+                tgt_ = self.tgt_embed.weight[:topk, None, :].repeat(1, bs, 1).transpose(0, 1) # nq, bs, d_model
             else:
                 tgt_ = tgt_undetach.detach()
 
@@ -391,6 +391,8 @@ class DeformableTransformer(nn.Module):
         #########################################################
         # Begin Decoder
         #########################################################
+        if attn_mask is not None and attn_mask.shape[0] != tgt.shape[1]:
+            attn_mask = attn_mask[: tgt.shape[1], : tgt.shape[1]]
         hs, references = self.decoder(
                 tgt=tgt.transpose(0, 1), 
                 memory=memory.transpose(0, 1), 
@@ -555,7 +557,7 @@ class TransformerEncoder(nn.Module):
                 output_memory = self.enc_norm[layer_id](self.enc_proj[layer_id](output_memory))
                 
                 # gather boxes
-                topk = self.num_queries
+                topk = min(self.num_queries, enc_outputs_class.shape[1])
                 enc_outputs_class = self.class_embed[layer_id](output_memory)
                 ref_token_index = torch.topk(enc_outputs_class.max(-1)[0], topk, dim=1)[1] # bs, nq
                 ref_token_coord = torch.gather(output_proposals, 1, ref_token_index.unsqueeze(-1).repeat(1, 1, 4))
@@ -1067,4 +1069,3 @@ def build_deformable_transformer(args):
         embed_init_tgt=args.embed_init_tgt,
         use_detached_boxes_dec_out=use_detached_boxes_dec_out
     )
-

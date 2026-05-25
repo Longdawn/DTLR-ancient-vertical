@@ -78,6 +78,7 @@ def get_args_parser():
     parser.add_argument("--new_class_embedding", action="store_true")
     parser.add_argument("--smart_mapping", action="store_true")
     parser.add_argument("--resume_finetuning", action="store_true")
+    parser.add_argument("--path_old_charset", type=str, default=None)
     parser.add_argument("--language", type=str, default=None)
 
     return parser
@@ -217,6 +218,11 @@ def main(args):
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers)
 
     args.charset = dataset_train.charset
+    if args.output_dir and utils.is_main_process():
+        with open(os.path.join(args.output_dir, "charset.pkl"), "wb") as f:
+            pickle.dump(args.charset, f)
+        with open(os.path.join(args.output_dir, "charset.json"), "w", encoding="utf-8") as f:
+            json.dump(args.charset, f, ensure_ascii=False, indent=2)
 
 
     if args.onecyclelr:
@@ -319,7 +325,10 @@ def main(args):
 
         if args.smart_mapping:
  
-            old_charset = pickle.load(open('/home/rbaena/projects/OCR/DINO/datasets/charset_symbol.pkl', "rb"))
+            if args.path_old_charset is not None:
+                old_charset = pickle.load(open(args.path_old_charset, "rb"))
+            else:
+                old_charset = pickle.load(open('/home/rbaena/projects/OCR/DINO/datasets/charset_symbol.pkl', "rb"))
 
             not_mapped = []
             possible_mapping = list(range(len(old_charset)))
@@ -363,6 +372,24 @@ def main(args):
         model.class_embed = new_class_embed.to(device) ### This is used for the dn process but will not be used during the finetuning, we define it to avoid errors
         model.transformer.enc_out_class_embed = new_enc_out_class_embed.to(device)
         model.label_enc = new_label_enc.to(device)
+
+        # The optimizer is created before optional class-head replacement in the
+        # original training flow. Rebuild it here so newly-created target
+        # charset heads are actually optimized during stage-1 adaptation.
+        param_dicts = get_param_dict(args, model_without_ddp)
+        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, weight_decay=args.weight_decay)
+        if args.onecyclelr:
+            lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=args.lr,
+                steps_per_epoch=len(data_loader_train),
+                epochs=args.epochs,
+                pct_start=0.2,
+            )
+        elif args.multi_step_lr:
+            lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=args.lr_drop_list)
+        else:
+            lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop)
         
         # # parameters_to_optimize = list(model.class_embed.parameters()) + \
         # #                          list(model.transformer.decoder.class_embed.parameters()) + \
@@ -380,7 +407,8 @@ def main(args):
         if args.distributed:
             sampler_train.set_epoch(epoch)
 
-        dataset_train.generates_synthetic_data()
+        if hasattr(dataset_train, "generates_synthetic_data"):
+            dataset_train.generates_synthetic_data()
         train_stats = train_one_epoch(
         model, criterion, data_loader_train, optimizer, device, epoch,
         args.clip_max_norm, wo_class_error=wo_class_error, lr_scheduler=lr_scheduler, args=args, logger=(logger if args.save_log else None), 

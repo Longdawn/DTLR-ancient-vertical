@@ -14,11 +14,15 @@ import torch
 from torch.utils.cpp_extension import CUDA_HOME
 from torch.utils.cpp_extension import CppExtension
 from torch.utils.cpp_extension import CUDAExtension
+import torch.utils.cpp_extension as torch_cpp_ext
 
 from setuptools import find_packages
 from setuptools import setup
 
 requirements = ["torch", "torchvision"]
+
+if os.environ.get("DTLR_SKIP_CUDA_VERSION_CHECK", "0") == "1":
+    torch_cpp_ext._check_cuda_version = lambda *args, **kwargs: None
 
 def get_extensions():
     this_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,7 +39,8 @@ def get_extensions():
 
 
 
-    if torch.cuda.is_available() and CUDA_HOME is not None:
+    force_cuda = os.environ.get("FORCE_CUDA", "0") == "1"
+    if (torch.cuda.is_available() or force_cuda) and CUDA_HOME is not None:
         extension = CUDAExtension
         sources += source_cuda
         define_macros += [("WITH_CUDA", None)]

@@ -19,6 +19,15 @@ from util.visualizer import COCOVisualizer
 from util import box_ops
 vslzr = COCOVisualizer()
 
+
+def _get_scheduler_lrs(lr_scheduler, optimizer):
+    if lr_scheduler is not None and hasattr(lr_scheduler, "get_last_lr"):
+        try:
+            return lr_scheduler.get_last_lr()
+        except Exception:
+            pass
+    return [group["lr"] for group in optimizer.param_groups]
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, 
@@ -270,7 +279,7 @@ def train_one_epoch_CTC(model: torch.nn.Module, criterion: torch.nn.Module,
     if getattr(criterion, 'loss_weight_decay', False):
         resstat.update({f'weight_{k}': v for k,v in criterion.weight_dict.items()})
 
-    run.log({'lr_scheduler': lr_scheduler.get_last_lr()})
+    run.log({'lr_scheduler': _get_scheduler_lrs(lr_scheduler, optimizer)})
     return resstat
 
 

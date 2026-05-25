@@ -13,6 +13,7 @@
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -25,6 +26,8 @@ at::Tensor ms_deform_attn_cuda_forward(
     const at::Tensor &attn_weight,
     const int im2col_step)
 {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(value));
+
     AT_ASSERTM(value.is_contiguous(), "value tensor has to be contiguous");
     AT_ASSERTM(spatial_shapes.is_contiguous(), "spatial_shapes tensor has to be contiguous");
     AT_ASSERTM(level_start_index.is_contiguous(), "level_start_index tensor has to be contiguous");
@@ -89,6 +92,7 @@ std::vector<at::Tensor> ms_deform_attn_cuda_backward(
     const at::Tensor &grad_output,
     const int im2col_step)
 {
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(value));
 
     AT_ASSERTM(value.is_contiguous(), "value tensor has to be contiguous");
     AT_ASSERTM(spatial_shapes.is_contiguous(), "spatial_shapes tensor has to be contiguous");

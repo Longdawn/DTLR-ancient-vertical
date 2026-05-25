@@ -1,0 +1,194 @@
+import argparse
+import json
+from collections import defaultdict
+from pathlib import Path
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import torch
+from torch.utils.data import DataLoader
+
+import util.misc as utils
+from datasets import build_dataset
+from finetuning import build_model_main
+from tools.analyze_ctc_errors import (
+    Totals,
+    _adapt_class_head,
+    _load_compatible_state,
+    length_bin,
+    levenshtein_ops,
+    load_cfg_to_args,
+    remove_duplicates,
+)
+from util.slconfig import DictAction
+
+
+def parse_args():
+    parser = argparse.ArgumentParser("Sweep CTC decode-time blank/nonblank biases")
+    parser.add_argument("--config_file", "-c", type=str, required=True)
+    parser.add_argument("--dataset_file", type=str, default="mth1000")
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_samples", type=int, default=5000)
+    parser.add_argument("--new_class_embedding", action="store_true")
+    parser.add_argument("--blank_biases", nargs="+", type=float, default=[0.0])
+    parser.add_argument(
+        "--nonblank_biases",
+        nargs="+",
+        type=float,
+        default=[0.0, 0.05, 0.1, 0.15, 0.2, 0.3],
+    )
+    parser.add_argument(
+        "--ratio_nonblank_biases",
+        nargs="+",
+        type=float,
+        default=[0.0, 0.05, 0.1, 0.15, 0.2],
+    )
+    parser.add_argument("--ratio_min", type=float, default=1.5)
+    parser.add_argument("--ratio_max", type=float, default=2.0)
+    parser.add_argument("--output_json", type=str, required=True)
+    parser.add_argument(
+        "--options",
+        nargs="+",
+        action=DictAction,
+        help="Override config values, same format as finetuning.py --options.",
+    )
+    return parser.parse_args()
+
+
+def build_settings(cli):
+    settings = []
+    for blank_bias in cli.blank_biases:
+        for nonblank_bias in cli.nonblank_biases:
+            for ratio_nonblank_bias in cli.ratio_nonblank_biases:
+                settings.append(
+                    {
+                        "blank_bias": float(blank_bias),
+                        "nonblank_bias": float(nonblank_bias),
+                        "ratio_nonblank_bias": float(ratio_nonblank_bias),
+                    }
+                )
+    return settings
+
+
+def ratio_from_target(target):
+    orig_size = target["orig_size"]
+    if torch.is_tensor(orig_size):
+        h, w = orig_size.detach().cpu().tolist()
+    else:
+        h, w = orig_size
+    return float(h) / max(float(w), 1.0)
+
+
+def calibrated_argmax(pred_probs, target, setting, cli):
+    scores = torch.log(pred_probs.clamp(min=1e-12))
+    scores[..., 0] += setting["blank_bias"]
+    scores[..., 1:] += setting["nonblank_bias"]
+    ratio = ratio_from_target(target)
+    if cli.ratio_min < ratio <= cli.ratio_max:
+        scores[..., 1:] += setting["ratio_nonblank_bias"]
+    return scores.argmax(-1)[0].tolist()
+
+
+def make_summary(total, by_len_bin):
+    summary = total.to_summary()
+    summary["by_gt_len_bin"] = {
+        key: by_len_bin[key].to_summary()
+        for key in ["1", "2", "3-5", "6-10", "11+"]
+        if by_len_bin[key].n > 0
+    }
+    return summary
+
+
+def main():
+    cli = parse_args()
+    args = load_cfg_to_args(cli)
+    device = torch.device(cli.device if torch.cuda.is_available() and "cuda" in cli.device else "cpu")
+
+    dataset = build_dataset(image_set=cli.split, args=args)
+    args.charset = dataset.charset
+    model, criterion, _ = build_model_main(args)
+    model.to(device)
+    model.eval()
+    criterion.eval()
+
+    if cli.new_class_embedding:
+        _adapt_class_head(model, len(dataset.charset), device)
+
+    ckpt = torch.load(cli.checkpoint, map_location="cpu")
+    ckpt_model = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    skipped = _load_compatible_state(model, ckpt_model)
+    print(f"Loaded checkpoint with {len(skipped)} skipped keys")
+
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=cli.num_workers,
+        collate_fn=utils.collate_fn,
+    )
+
+    settings = build_settings(cli)
+    totals = [Totals() for _ in settings]
+    by_len_bins = [defaultdict(Totals) for _ in settings]
+
+    with torch.no_grad():
+        for i, (samples, targets) in enumerate(loader):
+            if i >= cli.max_samples:
+                break
+            samples = samples.to(device)
+            targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
+            outputs = model(samples)
+            _, pred_probs, _ = criterion.loss_CTC(outputs, targets, None, None, return_preds=True)
+
+            gt_labels = [int(x) for x in targets[0]["labels"].tolist()]
+            gt_len = len(gt_labels)
+            gt_bin = length_bin(gt_len)
+
+            for idx, setting in enumerate(settings):
+                pred_tokens = calibrated_argmax(pred_probs, targets[0], setting, cli)
+                pred_tokens = remove_duplicates(pred_tokens)
+                pred_labels = [t - 1 for t in pred_tokens if 1 <= t <= len(dataset.charset)]
+                pred_len = len(pred_labels)
+                dist, ins, dels, subs = levenshtein_ops(gt_labels, pred_labels)
+                totals[idx].add(gt_len, pred_len, dist, ins, dels, subs)
+                by_len_bins[idx][gt_bin].add(gt_len, pred_len, dist, ins, dels, subs)
+
+    results = []
+    for setting, total, by_len_bin in zip(settings, totals, by_len_bins):
+        summary = make_summary(total, by_len_bin)
+        results.append({**setting, **summary})
+
+    results.sort(key=lambda row: row["cer_micro"])
+    out_path = Path(cli.output_json)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("Top decode-bias settings by CER:")
+    print("rank blank nonblank ratio_bias cer pred/gt empty del sub len1 len2 len11+")
+    for rank, row in enumerate(results[:20], start=1):
+        bins = row["by_gt_len_bin"]
+        print(
+            rank,
+            f"{row['blank_bias']:.3f}",
+            f"{row['nonblank_bias']:.3f}",
+            f"{row['ratio_nonblank_bias']:.3f}",
+            f"{row['cer_micro']:.6f}",
+            f"{row['pred_gt_len_ratio']:.6f}",
+            f"{row['empty_pred_rate']:.6f}",
+            f"{row['del_rate']:.6f}",
+            f"{row['sub_rate']:.6f}",
+            f"{bins.get('1', {}).get('cer_micro', 0):.6f}",
+            f"{bins.get('2', {}).get('cer_micro', 0):.6f}",
+            f"{bins.get('11+', {}).get('cer_micro', 0):.6f}",
+        )
+    print(f"Saved sweep results -> {out_path}")
+
+
+if __name__ == "__main__":
+    main()
