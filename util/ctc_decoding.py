@@ -18,6 +18,11 @@ def collapse_ctc(tokens: Iterable[int], blank: int = 0) -> list[int]:
 
 def decode_greedy(pred_probs: torch.Tensor, charset_size: int, blank: int = 0) -> list[int]:
     if pred_probs.ndim == 3:
+        if pred_probs.shape[0] != 1:
+            raise ValueError(
+                "decode_greedy is a single sample helper; expected CTC batch size 1, "
+                f"got batch size {pred_probs.shape[0]}"
+            )
         token_ids = pred_probs.argmax(-1)[0].tolist()
     elif pred_probs.ndim == 2:
         token_ids = pred_probs.argmax(-1).tolist()

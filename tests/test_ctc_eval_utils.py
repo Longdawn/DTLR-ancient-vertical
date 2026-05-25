@@ -31,6 +31,12 @@ class CtcDecodingTest(unittest.TestCase):
         )
         self.assertEqual(decode_greedy(pred_probs, charset_size=3), [0, 1, 2])
 
+    def test_decode_greedy_rejects_multi_sample_batch(self):
+        pred_probs = torch.zeros((2, 3, 4), dtype=torch.float32)
+
+        with self.assertRaisesRegex(ValueError, "batch size 1|single sample"):
+            decode_greedy(pred_probs, charset_size=3)
+
     def test_ratio_from_target_accepts_tensor_and_missing_orig_size(self):
         self.assertAlmostEqual(
             ratio_from_target({"orig_size": torch.tensor([120.0, 40.0])}),
