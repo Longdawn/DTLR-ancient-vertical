@@ -3,6 +3,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+import torch
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -83,6 +86,62 @@ class PaperWorkflowToolsTest(unittest.TestCase):
         self.assertIn("MTH1000 Paper Run Comparison", md)
         self.assertIn("Delta Vs Baseline", md)
         self.assertIn("run_a", md)
+
+    def test_validate_ratio_bias_target_accepts_numeric_orig_size_shapes(self):
+        tool = load_module(ROOT / "tools" / "sweep_ctc_decode_bias.py")
+
+        valid_targets = [
+            {"orig_size": torch.tensor([120.0, 40.0])},
+            {"orig_size": [120.0, 40.0]},
+            {"orig_size": (120, 40)},
+            {"orig_size": np.array([120.0, 40.0], dtype=np.float32)},
+        ]
+
+        for target in valid_targets:
+            with self.subTest(orig_size=type(target["orig_size"]).__name__):
+                tool.validate_ratio_bias_target(target)
+
+    def test_validate_ratio_bias_target_rejects_invalid_orig_size_shapes(self):
+        tool = load_module(ROOT / "tools" / "sweep_ctc_decode_bias.py")
+
+        invalid_targets = [
+            {},
+            {"orig_size": "120,40"},
+            {"orig_size": b"120,40"},
+            {"orig_size": [120.0]},
+            {"orig_size": [120.0, "40"]},
+        ]
+
+        for target in invalid_targets:
+            with self.subTest(orig_size=target.get("orig_size")):
+                with self.assertRaises(ValueError):
+                    tool.validate_ratio_bias_target(target)
+
+    def test_analyze_ctc_errors_skips_ratio_bias_without_orig_size(self):
+        tool = load_module(ROOT / "tools" / "analyze_ctc_errors.py")
+        pred_probs = torch.tensor([[[0.51, 0.49], [0.60, 0.40]]], dtype=torch.float32)
+
+        cli = type(
+            "CliArgs",
+            (),
+            {
+                "blank_bias": 0.0,
+                "nonblank_bias": 0.0,
+                "ratio_nonblank_bias": 1.0,
+                "ratio_min": 0.5,
+                "ratio_max": 1.5,
+            },
+        )()
+
+        without_orig_size = tool.calibrate_decode_scores(pred_probs, {"labels": torch.tensor([0])}, cli)
+        with_orig_size = tool.calibrate_decode_scores(
+            pred_probs,
+            {"labels": torch.tensor([0]), "orig_size": torch.tensor([120.0, 120.0])},
+            cli,
+        )
+
+        self.assertEqual(tool.decode_greedy(without_orig_size, charset_size=1), [])
+        self.assertEqual(tool.decode_greedy(with_orig_size, charset_size=1), [0])
 
 
 if __name__ == "__main__":

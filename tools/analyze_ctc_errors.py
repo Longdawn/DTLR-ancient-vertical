@@ -1,6 +1,7 @@
 import argparse
 import json
 from collections import defaultdict
+from numbers import Number
 from pathlib import Path
 from typing import List
 import os
@@ -132,6 +133,37 @@ def _load_compatible_state(model, checkpoint_model):
     return skipped
 
 
+def _has_usable_orig_size(target):
+    orig_size = target.get("orig_size") if isinstance(target, dict) else None
+    if orig_size is None:
+        return False
+    if torch.is_tensor(orig_size):
+        values = orig_size.detach().cpu().reshape(-1)
+        return values.numel() >= 2
+    if isinstance(orig_size, (str, bytes)):
+        return False
+    try:
+        values = list(orig_size)
+    except TypeError:
+        return False
+    if len(values) < 2:
+        return False
+    return isinstance(values[0], Number) and isinstance(values[1], Number)
+
+
+def calibrate_decode_scores(pred_probs, target, cli):
+    ratio_nonblank_bias = cli.ratio_nonblank_bias if _has_usable_orig_size(target) else 0.0
+    return apply_ctc_calibration(
+        pred_probs,
+        target=target,
+        blank_bias=cli.blank_bias,
+        nonblank_bias=cli.nonblank_bias,
+        ratio_nonblank_bias=ratio_nonblank_bias,
+        ratio_min=cli.ratio_min,
+        ratio_max=cli.ratio_max,
+    )
+
+
 def main():
     cli = parse_args()
     args = load_cfg_to_args(cli)
@@ -173,15 +205,7 @@ def main():
             targets = [{k: (v.to(device) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
             outputs = model(samples)
             _, pred_probs, _ = criterion.loss_CTC(outputs, targets, None, None, return_preds=True)
-            decode_scores = apply_ctc_calibration(
-                pred_probs,
-                target=targets[0],
-                blank_bias=cli.blank_bias,
-                nonblank_bias=cli.nonblank_bias,
-                ratio_nonblank_bias=cli.ratio_nonblank_bias,
-                ratio_min=cli.ratio_min,
-                ratio_max=cli.ratio_max,
-            )
+            decode_scores = calibrate_decode_scores(pred_probs, targets[0], cli)
             pred_labels = decode_greedy(decode_scores, len(dataset.charset))
             gt_labels = [int(x) for x in targets[0]["labels"].tolist()]
 
