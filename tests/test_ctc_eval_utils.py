@@ -63,6 +63,46 @@ class CtcDecodingTest(unittest.TestCase):
         self.assertEqual(outside.argmax(-1)[0].tolist(), [0, 0])
         self.assertEqual(inside.argmax(-1)[0].tolist(), [1, 1])
 
+    def test_apply_ctc_calibration_applies_bias_only_inside_margin_gate(self):
+        pred_probs = torch.tensor(
+            [
+                [
+                    [0.60, 0.40],  # margin = 0.20, inside gate
+                    [0.90, 0.10],  # margin = 0.80, outside gate
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        calibrated = apply_ctc_calibration(
+            pred_probs,
+            blank_bias=-0.6,
+            nonblank_bias=0.6,
+            margin_gate_min=0.1,
+            margin_gate_max=0.3,
+        )
+
+        self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 0])
+
+    def test_apply_ctc_calibration_without_gate_keeps_global_bias_behavior(self):
+        pred_probs = torch.tensor(
+            [
+                [
+                    [0.60, 0.40],
+                    [0.55, 0.45],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        calibrated = apply_ctc_calibration(
+            pred_probs,
+            blank_bias=-0.6,
+            nonblank_bias=0.6,
+        )
+
+        self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 1])
+
 
 class CtcMetricsTest(unittest.TestCase):
     def test_length_bin_boundaries(self):

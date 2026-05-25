@@ -117,6 +117,27 @@ class PaperWorkflowToolsTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     tool.validate_ratio_bias_target(target)
 
+    def test_build_settings_supports_margin_gate_ranges(self):
+        tool = load_module(ROOT / "tools" / "sweep_ctc_decode_bias.py")
+        cli = type(
+            "CliArgs",
+            (),
+            {
+                "blank_biases": [-0.3],
+                "nonblank_biases": [0.3],
+                "ratio_nonblank_biases": [0.0],
+                "margin_gate_mins": [0.1, 0.2],
+                "margin_gate_maxs": [0.3],
+            },
+        )()
+
+        settings = tool.build_settings(cli)
+        self.assertEqual(len(settings), 2)
+        self.assertEqual(settings[0]["margin_gate_min"], 0.1)
+        self.assertEqual(settings[0]["margin_gate_max"], 0.3)
+        self.assertEqual(settings[1]["margin_gate_min"], 0.2)
+        self.assertEqual(settings[1]["margin_gate_max"], 0.3)
+
     def test_analyze_ctc_errors_skips_ratio_bias_without_orig_size(self):
         tool = load_module(ROOT / "tools" / "analyze_ctc_errors.py")
         pred_probs = torch.tensor([[[0.51, 0.49], [0.60, 0.40]]], dtype=torch.float32)

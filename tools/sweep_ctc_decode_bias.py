@@ -48,6 +48,20 @@ def parse_args():
         type=float,
         default=[0.0, 0.05, 0.1, 0.15, 0.2],
     )
+    parser.add_argument(
+        "--margin_gate_mins",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Only apply blank/nonblank bias when blank-top_nonblank margin is >= this value.",
+    )
+    parser.add_argument(
+        "--margin_gate_maxs",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Only apply blank/nonblank bias when blank-top_nonblank margin is <= this value.",
+    )
     parser.add_argument("--ratio_min", type=float, default=1.5)
     parser.add_argument("--ratio_max", type=float, default=2.0)
     parser.add_argument("--output_json", type=str, required=True)
@@ -61,17 +75,33 @@ def parse_args():
 
 
 def build_settings(cli):
+    if (cli.margin_gate_mins is None) != (cli.margin_gate_maxs is None):
+        raise ValueError("margin-gated decode sweep requires both --margin_gate_mins and --margin_gate_maxs")
+
+    margin_gate_mins = cli.margin_gate_mins if cli.margin_gate_mins is not None else [None]
+    margin_gate_maxs = cli.margin_gate_maxs if cli.margin_gate_maxs is not None else [None]
     settings = []
     for blank_bias in cli.blank_biases:
         for nonblank_bias in cli.nonblank_biases:
             for ratio_nonblank_bias in cli.ratio_nonblank_biases:
-                settings.append(
-                    {
-                        "blank_bias": float(blank_bias),
-                        "nonblank_bias": float(nonblank_bias),
-                        "ratio_nonblank_bias": float(ratio_nonblank_bias),
-                    }
-                )
+                for margin_gate_min in margin_gate_mins:
+                    for margin_gate_max in margin_gate_maxs:
+                        if margin_gate_min is not None and margin_gate_max is not None:
+                            if float(margin_gate_min) > float(margin_gate_max):
+                                raise ValueError("margin_gate_min must be <= margin_gate_max")
+                        settings.append(
+                            {
+                                "blank_bias": float(blank_bias),
+                                "nonblank_bias": float(nonblank_bias),
+                                "ratio_nonblank_bias": float(ratio_nonblank_bias),
+                                "margin_gate_min": (
+                                    None if margin_gate_min is None else float(margin_gate_min)
+                                ),
+                                "margin_gate_max": (
+                                    None if margin_gate_max is None else float(margin_gate_max)
+                                ),
+                            }
+                        )
     return settings
 
 
@@ -190,6 +220,8 @@ def main():
                     ratio_nonblank_bias=setting["ratio_nonblank_bias"],
                     ratio_min=cli.ratio_min,
                     ratio_max=cli.ratio_max,
+                    margin_gate_min=setting["margin_gate_min"],
+                    margin_gate_max=setting["margin_gate_max"],
                 )
                 pred_labels = decode_greedy(calibrated_scores, len(dataset.charset))
                 pred_len = len(pred_labels)
@@ -208,7 +240,7 @@ def main():
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("Top decode-bias settings by CER:")
-    print("rank blank nonblank ratio_bias cer pred/gt empty del sub len1 len2 len11+")
+    print("rank blank nonblank ratio_bias gate_min gate_max cer pred/gt empty del sub len1 len2 len11+")
     for rank, row in enumerate(results[:20], start=1):
         bins = row["by_gt_len_bin"]
         print(
@@ -216,6 +248,8 @@ def main():
             f"{row['blank_bias']:.3f}",
             f"{row['nonblank_bias']:.3f}",
             f"{row['ratio_nonblank_bias']:.3f}",
+            "none" if row["margin_gate_min"] is None else f"{row['margin_gate_min']:.3f}",
+            "none" if row["margin_gate_max"] is None else f"{row['margin_gate_max']:.3f}",
             f"{row['cer_micro']:.6f}",
             f"{row['pred_gt_len_ratio']:.6f}",
             f"{row['empty_pred_rate']:.6f}",

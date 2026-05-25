@@ -56,13 +56,31 @@ def apply_ctc_calibration(
     ratio_nonblank_bias: float = 0.0,
     ratio_min: float = 1.5,
     ratio_max: float = 2.0,
+    margin_gate_min: float | None = None,
+    margin_gate_max: float | None = None,
 ) -> torch.Tensor:
     if blank_bias == 0.0 and nonblank_bias == 0.0 and ratio_nonblank_bias == 0.0:
         return pred_probs
 
     scores = torch.log(pred_probs.clamp(min=1e-12))
-    scores[..., 0] += float(blank_bias)
-    scores[..., 1:] += float(nonblank_bias)
+    use_margin_gate = margin_gate_min is not None or margin_gate_max is not None
+    if use_margin_gate:
+        if margin_gate_min is None or margin_gate_max is None:
+            raise ValueError("margin gate requires both margin_gate_min and margin_gate_max")
+        if float(margin_gate_min) > float(margin_gate_max):
+            raise ValueError("margin_gate_min must be <= margin_gate_max")
+
+        if blank_bias != 0.0 or nonblank_bias != 0.0:
+            blank_probs = pred_probs[..., 0]
+            best_nonblank_probs = pred_probs[..., 1:].amax(dim=-1)
+            margins = blank_probs - best_nonblank_probs
+            gate_mask = (margins >= float(margin_gate_min)) & (margins <= float(margin_gate_max))
+            gate_bias = gate_mask.to(scores.dtype)
+            scores[..., 0] += float(blank_bias) * gate_bias
+            scores[..., 1:] += float(nonblank_bias) * gate_bias.unsqueeze(-1)
+    else:
+        scores[..., 0] += float(blank_bias)
+        scores[..., 1:] += float(nonblank_bias)
 
     if ratio_nonblank_bias != 0.0 and target is not None:
         ratio = ratio_from_target(target)
