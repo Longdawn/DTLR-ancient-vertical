@@ -1,6 +1,8 @@
 import argparse
 import json
 from collections import defaultdict
+from collections.abc import Sequence
+from numbers import Number
 from pathlib import Path
 import sys
 
@@ -90,28 +92,34 @@ def validate_ratio_bias_target(target):
             "height and width values"
         )
     if torch.is_tensor(orig_size):
-        values = orig_size.detach().cpu().reshape(-1).tolist()
-    else:
-        try:
-            values = list(orig_size)
-        except TypeError as exc:
+        values = orig_size.detach().cpu().reshape(-1)
+        if values.numel() < 2:
             raise ValueError(
-                "ratio-conditioned CTC bias requires target['orig_size'] to be an iterable "
-                "of height and width values"
-            ) from exc
-    if len(values) < 2:
-        raise ValueError(
-            "ratio-conditioned CTC bias requires target['orig_size'] with at least "
-            "height and width values"
-        )
-    try:
-        float(values[0])
-        float(values[1])
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            "ratio-conditioned CTC bias requires numeric height/width in "
-            "target['orig_size']"
-        ) from exc
+                "ratio-conditioned CTC bias requires target['orig_size'] with at least "
+                "height and width values"
+            )
+        values = values.tolist()
+    else:
+        if isinstance(orig_size, (str, bytes)):
+            raise ValueError(
+                "ratio-conditioned CTC bias requires target['orig_size'] to be a "
+                "non-string sequence of numeric height and width values"
+            )
+        if not isinstance(orig_size, Sequence):
+            raise ValueError(
+                "ratio-conditioned CTC bias requires target['orig_size'] to be a "
+                "non-string sequence of numeric height and width values"
+            )
+        if len(orig_size) < 2:
+            raise ValueError(
+                "ratio-conditioned CTC bias requires target['orig_size'] with at least "
+                "height and width values"
+            )
+        if not isinstance(orig_size[0], Number) or not isinstance(orig_size[1], Number):
+            raise ValueError(
+                "ratio-conditioned CTC bias requires numeric height/width in "
+                "target['orig_size']"
+            )
 
 
 def make_summary(total, by_len_bin):
