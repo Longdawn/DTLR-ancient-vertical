@@ -2,6 +2,19 @@
 
 This repository is for DTLR-based vertical ancient text recognition experiments.
 
+## Long-Term Project Rules
+
+- This project is vertical ancient-book text recognition.
+- Scope is single-column / line-level recognition only.
+- Do not frame the project as page-level layout analysis, full-page detection, reading-order prediction, or document layout parsing.
+- Prefer Chinese when answering the user unless they explicitly request another language.
+- Before modifying code, configs, training logic, evaluation logic, or experiment scripts, read `docs/CODEX_HANDOFF.md` first.
+- Long training must be launched in `tmux`; do not run long training in a foreground Codex exec session.
+- Report experiments with CER/AR/CR and length-bucket metrics. A result is not paper-ready if it only has training loss or a single aggregate CER.
+- For recognition experiments, include short-text behavior when available: `len=1`, `len=2`, `len=3-5`, `len=6-10`, `len>=11`, empty prediction rate, and pred/GT length ratio.
+- Keep `experiments/notes/goal_status.md` updates sparse: update only for launches, validation results, training completion, failures, or major result/file changes.
+- Commands with unknown or potentially large output must be byte-capped, for example `2>&1 | head -c 4000`.
+
 ## Core Entry Points
 
 - `main_synthetic.py`: stage-1 detection pretraining.
@@ -62,4 +75,3 @@ Do not assume `max_iterations` will stop the run early. In this project, stage-1
 
 - Low-resolution stage-1 synthetic runs can look numerically stable but transfer poorly.
 - A synthetic stage-1 checkpoint should not be used downstream unless its MTH1000 valid box diagnostic is competitive with the trusted real stage-1 baseline.
-

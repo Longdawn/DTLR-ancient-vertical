@@ -33,6 +33,15 @@ def decode_greedy(pred_probs: torch.Tensor, charset_size: int, blank: int = 0) -
     return [token - 1 for token in collapsed if 1 <= token <= int(charset_size)]
 
 
+def ctc_collapsed_nonblank_lengths(token_ids: torch.Tensor, blank: int = 0) -> torch.Tensor:
+    if token_ids.ndim != 2:
+        raise ValueError(f"expected token ids with shape [B, T], got {tuple(token_ids.shape)}")
+    nonblank = token_ids != int(blank)
+    starts = torch.ones_like(nonblank)
+    starts[:, 1:] = token_ids[:, 1:] != token_ids[:, :-1]
+    return (nonblank & starts).sum(dim=-1)
+
+
 def ratio_from_target(target: dict, default: float = 1.0) -> float:
     orig_size = target.get("orig_size") if isinstance(target, dict) else None
     if orig_size is None:
@@ -58,11 +67,38 @@ def apply_ctc_calibration(
     ratio_max: float = 2.0,
     margin_gate_min: float | None = None,
     margin_gate_max: float | None = None,
+    adaptive_mode: str = "none",
+    adaptive_min_scale: float = 1.0,
+    adaptive_max_scale: float = 1.0,
+    adaptive_short_pred_max_len: int = 2,
 ) -> torch.Tensor:
-    if blank_bias == 0.0 and nonblank_bias == 0.0 and ratio_nonblank_bias == 0.0:
+    if (
+        blank_bias == 0.0
+        and nonblank_bias == 0.0
+        and ratio_nonblank_bias == 0.0
+    ):
         return pred_probs
 
     scores = torch.log(pred_probs.clamp(min=1e-12))
+    adaptive_mode = str(adaptive_mode or "none")
+    if adaptive_mode not in {"none", "empty", "pred_short"}:
+        raise ValueError(f"unknown adaptive CTC calibration mode: {adaptive_mode}")
+
+    scale = torch.ones_like(pred_probs[..., 0])
+    if adaptive_mode in {"empty", "pred_short"}:
+        clean_tokens = pred_probs.argmax(-1)
+        if adaptive_mode == "empty":
+            trigger_mask = ~(clean_tokens != 0).any(dim=-1)
+        else:
+            clean_lengths = ctc_collapsed_nonblank_lengths(clean_tokens)
+            trigger_mask = clean_lengths <= int(adaptive_short_pred_max_len)
+        sample_scale = torch.where(
+            trigger_mask,
+            torch.full_like(trigger_mask, float(adaptive_max_scale), dtype=scores.dtype),
+            torch.full_like(trigger_mask, float(adaptive_min_scale), dtype=scores.dtype),
+        )
+        scale = sample_scale.unsqueeze(-1).expand_as(scale)
+
     use_margin_gate = margin_gate_min is not None or margin_gate_max is not None
     if use_margin_gate:
         if margin_gate_min is None or margin_gate_max is None:
@@ -75,12 +111,12 @@ def apply_ctc_calibration(
             best_nonblank_probs = pred_probs[..., 1:].amax(dim=-1)
             margins = blank_probs - best_nonblank_probs
             gate_mask = (margins >= float(margin_gate_min)) & (margins <= float(margin_gate_max))
-            gate_bias = gate_mask.to(scores.dtype)
+            gate_bias = gate_mask.to(scores.dtype) * scale
             scores[..., 0] += float(blank_bias) * gate_bias
             scores[..., 1:] += float(nonblank_bias) * gate_bias.unsqueeze(-1)
     else:
-        scores[..., 0] += float(blank_bias)
-        scores[..., 1:] += float(nonblank_bias)
+        scores[..., 0] += float(blank_bias) * scale
+        scores[..., 1:] += float(nonblank_bias) * scale.unsqueeze(-1)
 
     if ratio_nonblank_bias != 0.0 and target is not None:
         ratio = ratio_from_target(target)

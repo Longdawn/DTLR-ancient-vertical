@@ -74,6 +74,82 @@ def compute_query_count_loss(activation_logits, target_lengths, short_weight=1.0
     return loss.mean(), expected_count
 
 
+def compute_query_budget_loss(
+    pred_logits,
+    targets,
+    budget_scale=2.0,
+    budget_margin=8.0,
+):
+    nonblank_probs = pred_logits.sigmoid().amax(dim=-1)
+    expected_count = nonblank_probs.sum(dim=-1)
+    target_lengths = torch.tensor(
+        [float(target["labels"].numel()) for target in targets],
+        dtype=pred_logits.dtype,
+        device=pred_logits.device,
+    )
+    target_count = float(budget_scale) * target_lengths + float(budget_margin)
+    normalizer = target_lengths.clamp(min=1.0)
+    over_budget = (expected_count - target_count).clamp(min=0.0)
+    loss = ((over_budget**2) / normalizer).mean()
+    return loss, {
+        "expected_count_mean": float(expected_count.detach().mean().item()),
+        "target_count_mean": float(target_count.detach().mean().item()),
+    }
+
+
+def fuse_glyph_prototype_logits(pred_logits, pred_proto_logits, glyph_proto_fuse_coef=0.0):
+    if pred_proto_logits is None or float(glyph_proto_fuse_coef) == 0.0:
+        return pred_logits
+    return pred_logits + float(glyph_proto_fuse_coef) * pred_proto_logits
+
+
+def compute_short_query_ce_loss(char_probs, targets, max_len=0, gamma=0.0):
+    ce_losses = []
+    eligible_samples = 0
+    selected_chars = 0
+    device = char_probs.device
+
+    for batch_idx, target in enumerate(targets):
+        labels = target["labels"].long().to(device)
+        if labels.numel() == 0:
+            continue
+        if int(max_len) > 0 and labels.numel() > int(max_len):
+            continue
+
+        eligible_samples += 1
+        used_queries = torch.zeros(
+            char_probs.shape[1],
+            dtype=torch.bool,
+            device=device,
+        )
+        for label in labels:
+            if label.item() < 0 or label.item() >= char_probs.shape[-1]:
+                continue
+            scores = char_probs[batch_idx, :, label].detach().clone()
+            if used_queries.all():
+                used_queries.zero_()
+            scores[used_queries] = -1.0
+            query_idx = scores.argmax()
+            used_queries[query_idx] = True
+
+            prob = char_probs[batch_idx, query_idx, label].clamp(min=1e-8)
+            nll = -torch.log(prob)
+            if float(gamma) > 0:
+                nll = ((1.0 - prob).detach() ** float(gamma)) * nll
+            ce_losses.append(nll)
+            selected_chars += 1
+
+    if ce_losses:
+        loss = torch.stack(ce_losses).mean()
+    else:
+        loss = char_probs.sum() * 0.0
+
+    return loss, {
+        "eligible_samples": eligible_samples,
+        "selected_chars": selected_chars,
+    }
+
+
 class DINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
 
@@ -106,6 +182,10 @@ class DINO(nn.Module):
         use_direction_head=False,
         use_query_activation_head=False,
         query_activation_init_bias=0.0,
+        use_glyph_prototype_head=False,
+        glyph_proto_dim=256,
+        glyph_proto_temperature=1.0,
+        glyph_proto_trainable=True,
     ):
         """Initializes the model.
         Parameters:
@@ -131,6 +211,10 @@ class DINO(nn.Module):
         self.use_direction_head = use_direction_head
         self.use_query_activation_head = use_query_activation_head
         self.query_activation_init_bias = float(query_activation_init_bias)
+        self.use_glyph_prototype_head = bool(use_glyph_prototype_head)
+        self.glyph_proto_dim = int(glyph_proto_dim)
+        self.glyph_proto_temperature = float(glyph_proto_temperature)
+        self.glyph_proto_trainable = bool(glyph_proto_trainable)
 
         # setting query dim
         self.query_dim = query_dim
@@ -268,6 +352,17 @@ class DINO(nn.Module):
                 self.query_activation_embed.bias.data,
                 self.query_activation_init_bias,
             )
+        if self.use_glyph_prototype_head:
+            # Isolate prototype-branch random initialization so enabling this
+            # branch does not perturb later baseline-sensitive reinitialization
+            # paths such as `--new_class_embedding`.
+            torch_rng_state = torch.get_rng_state()
+            self.glyph_proto_proj = nn.Linear(hidden_dim, self.glyph_proto_dim)
+            self.glyph_prototype_table = nn.Embedding(num_classes, self.glyph_proto_dim)
+            nn.init.normal_(self.glyph_prototype_table.weight, std=0.02)
+            torch.set_rng_state(torch_rng_state)
+            if not self.glyph_proto_trainable:
+                self.glyph_prototype_table.weight.requires_grad_(False)
 
     def _reset_parameters(self):
         # init input_proj
@@ -404,6 +499,21 @@ class DINO(nn.Module):
         out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
         if self.use_query_activation_head:
             out["pred_activation_logits"] = self.query_activation_embed(hs[-1])
+        if self.use_glyph_prototype_head:
+            proto_query = F.normalize(self.glyph_proto_proj(hs[-1]), dim=-1)
+            proto_table = self.glyph_prototype_table.weight
+            current_num_classes = outputs_class[-1].shape[-1]
+            if proto_table.shape[0] != current_num_classes:
+                if proto_table.shape[0] < current_num_classes:
+                    raise RuntimeError(
+                        f"glyph prototype table has {proto_table.shape[0]} rows but "
+                        f"class head outputs {current_num_classes} classes"
+                    )
+                proto_table = proto_table[:current_num_classes]
+            proto_table = F.normalize(proto_table, dim=-1)
+            proto_logits = torch.matmul(proto_query, proto_table.transpose(0, 1))
+            proto_logits = proto_logits / max(self.glyph_proto_temperature, 1e-6)
+            out["pred_proto_logits"] = proto_logits
         if self.use_direction_head:
             out["pred_direction"] = self.direction_embed(hs[-1].mean(dim=1))
         if self.aux_loss:
@@ -494,9 +604,13 @@ class SetCriterion(nn.Module):
         use_query_activation_head=False,
         use_query_count_loss=False,
         use_activation_gating=False,
+        use_glyph_prototype_head=False,
+        glyph_proto_fuse_coef=0.0,
         activation_gate_blank_coef=0.0,
         activation_gate_nonblank_coef=0.0,
         query_count_short_weight=1.0,
+        query_budget_scale=2.0,
+        query_budget_margin=8.0,
     ):
         """Create the criterion.
         Parameters:
@@ -522,13 +636,18 @@ class SetCriterion(nn.Module):
         self.use_query_activation_head = bool(use_query_activation_head)
         self.use_query_count_loss = bool(use_query_count_loss)
         self.use_activation_gating = bool(use_activation_gating)
+        self.use_glyph_prototype_head = bool(use_glyph_prototype_head)
+        self.glyph_proto_fuse_coef = float(glyph_proto_fuse_coef)
         self.activation_gate_blank_coef = float(activation_gate_blank_coef)
         self.activation_gate_nonblank_coef = float(activation_gate_nonblank_coef)
         self.query_count_short_weight = float(query_count_short_weight)
+        self.query_budget_scale = float(query_budget_scale)
+        self.query_budget_margin = float(query_budget_margin)
         self.direction_loss_enabled = "loss_direction" in self.weight_dict
         self.ctc_count_loss_enabled = "loss_ctc_count" in self.weight_dict
         self.short_gt_presence_enabled = "loss_short_gt_presence" in self.weight_dict
         self.short_gt_ce_enabled = "loss_short_gt_ce" in self.weight_dict
+        self.query_budget_loss_enabled = "loss_query_budget" in self.weight_dict
         self.query_count_loss_enabled = (
             self.use_query_count_loss and "loss_query_count" in self.weight_dict
         )
@@ -593,6 +712,12 @@ class SetCriterion(nn.Module):
             return "horizontal"
 
         pred_logits = outputs["pred_logits"]
+        pred_proto_logits = outputs.get("pred_proto_logits")
+        pred_logits = fuse_glyph_prototype_logits(
+            pred_logits,
+            pred_proto_logits,
+            glyph_proto_fuse_coef=self.glyph_proto_fuse_coef,
+        )
         device = pred_logits.device
         
         pred_logits_topk = pred_logits
@@ -764,38 +889,22 @@ class SetCriterion(nn.Module):
                 losses["loss_short_gt_presence"] = loss * 0.0
 
         if self.short_gt_ce_enabled:
-            ce_losses = []
             char_probs = new_pred_logits[:, :, 1:].clamp(min=1e-8)
-            for batch_idx, target in enumerate(targets):
-                labels = target["labels"].long().to(device)
-                if labels.numel() == 0:
-                    continue
-                if self.short_gt_ce_max_len > 0 and labels.numel() > self.short_gt_ce_max_len:
-                    continue
-
-                used_queries = torch.zeros(
-                    char_probs.shape[1],
-                    dtype=torch.bool,
-                    device=device,
-                )
-                for label in labels:
-                    scores = char_probs[batch_idx, :, label].detach().clone()
-                    if used_queries.all():
-                        used_queries.zero_()
-                    scores[used_queries] = -1.0
-                    query_idx = scores.argmax()
-                    used_queries[query_idx] = True
-
-                    prob = char_probs[batch_idx, query_idx, label]
-                    nll = -torch.log(prob)
-                    if self.short_gt_ce_gamma > 0:
-                        nll = ((1.0 - prob).detach() ** self.short_gt_ce_gamma) * nll
-                    ce_losses.append(nll)
-
-            if ce_losses:
-                losses["loss_short_gt_ce"] = torch.stack(ce_losses).mean()
-            else:
-                losses["loss_short_gt_ce"] = loss * 0.0
+            short_gt_ce_loss, short_gt_ce_stats = compute_short_query_ce_loss(
+                char_probs,
+                targets,
+                max_len=self.short_gt_ce_max_len,
+                gamma=self.short_gt_ce_gamma,
+            )
+            losses["loss_short_gt_ce"] = short_gt_ce_loss
+            losses["short_gt_ce_eligible_samples"] = torch.tensor(
+                float(short_gt_ce_stats["eligible_samples"]),
+                device=device,
+            )
+            losses["short_gt_ce_selected_chars"] = torch.tensor(
+                float(short_gt_ce_stats["selected_chars"]),
+                device=device,
+            )
 
         if self.direction_loss_enabled:
             losses.update(self.loss_direction(outputs, targets, indices, num_boxes))
@@ -847,6 +956,25 @@ class SetCriterion(nn.Module):
             * src_logits.shape[1]
         )
         losses = {"loss_ce": loss_ce}
+
+        if self.query_budget_loss_enabled:
+            loss_query_budget, query_budget_stats = compute_query_budget_loss(
+                src_logits,
+                targets,
+                budget_scale=self.query_budget_scale,
+                budget_margin=self.query_budget_margin,
+            )
+            losses["loss_query_budget"] = loss_query_budget
+            losses["query_budget_expected_count"] = torch.tensor(
+                query_budget_stats["expected_count_mean"],
+                dtype=src_logits.dtype,
+                device=src_logits.device,
+            )
+            losses["query_budget_target_count"] = torch.tensor(
+                query_budget_stats["target_count_mean"],
+                dtype=src_logits.dtype,
+                device=src_logits.device,
+            )
 
         if log:
             # TODO this should probably be a separate loss, not hacked in this one here
@@ -1371,6 +1499,10 @@ def build_dino(args):
         use_direction_head=getattr(args, "use_direction_head", False),
         use_query_activation_head=getattr(args, "use_query_activation_head", False),
         query_activation_init_bias=getattr(args, "query_activation_init_bias", 0.0),
+        use_glyph_prototype_head=getattr(args, "use_glyph_prototype_head", False),
+        glyph_proto_dim=getattr(args, "glyph_proto_dim", 256),
+        glyph_proto_temperature=getattr(args, "glyph_proto_temperature", 1.0),
+        glyph_proto_trainable=getattr(args, "glyph_proto_trainable", True),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -1439,6 +1571,9 @@ def build_dino(args):
     query_count_loss_coef = getattr(args, "query_count_loss_coef", 0.0)
     if getattr(args, "use_query_count_loss", False) and query_count_loss_coef > 0:
         weight_dict["loss_query_count"] = query_count_loss_coef
+    query_budget_loss_coef = getattr(args, "query_budget_loss_coef", 0.0)
+    if getattr(args, "use_query_budget_loss", False) and query_budget_loss_coef > 0:
+        weight_dict["loss_query_budget"] = query_budget_loss_coef
     if getattr(args, "use_direction_head", False):
         weight_dict["loss_direction"] = getattr(args, "direction_loss_coef", 1.0)
 
@@ -1464,9 +1599,13 @@ def build_dino(args):
         use_query_activation_head=getattr(args, "use_query_activation_head", False),
         use_query_count_loss=getattr(args, "use_query_count_loss", False),
         use_activation_gating=getattr(args, "use_activation_gating", False),
+        use_glyph_prototype_head=getattr(args, "use_glyph_prototype_head", False),
+        glyph_proto_fuse_coef=getattr(args, "glyph_proto_fuse_coef", 0.0),
         activation_gate_blank_coef=getattr(args, "activation_gate_blank_coef", 0.0),
         activation_gate_nonblank_coef=getattr(args, "activation_gate_nonblank_coef", 0.0),
         query_count_short_weight=getattr(args, "query_count_short_weight", 1.0),
+        query_budget_scale=getattr(args, "query_budget_scale", 2.0),
+        query_budget_margin=getattr(args, "query_budget_margin", 8.0),
     )
     criterion.to(device)
     postprocessors = {

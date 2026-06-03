@@ -64,6 +64,39 @@ def parse_args():
     )
     parser.add_argument("--ratio_min", type=float, default=1.5)
     parser.add_argument("--ratio_max", type=float, default=2.0)
+    parser.add_argument(
+        "--adaptive_modes",
+        nargs="+",
+        default=["none"],
+        choices=["none", "empty", "pred_short"],
+        help=(
+            "Adaptive calibration modes. 'none' keeps fixed bias behavior. "
+            "'empty' applies adaptive_max_scale only when clean greedy decoding is empty, "
+            "otherwise adaptive_min_scale. 'pred_short' applies adaptive_max_scale when "
+            "clean collapsed CTC length is <= adaptive_short_pred_max_len."
+        ),
+    )
+    parser.add_argument(
+        "--adaptive_min_scales",
+        nargs="+",
+        type=float,
+        default=[1.0],
+        help="Bias scale for samples that do not trigger the adaptive condition.",
+    )
+    parser.add_argument(
+        "--adaptive_max_scales",
+        nargs="+",
+        type=float,
+        default=[1.0],
+        help="Bias scale for samples that trigger the adaptive condition.",
+    )
+    parser.add_argument(
+        "--adaptive_short_pred_max_lens",
+        nargs="+",
+        type=int,
+        default=[2],
+        help="Clean collapsed CTC length thresholds for adaptive_mode=pred_short.",
+    )
     parser.add_argument("--output_json", type=str, required=True)
     parser.add_argument(
         "--options",
@@ -89,19 +122,33 @@ def build_settings(cli):
                         if margin_gate_min is not None and margin_gate_max is not None:
                             if float(margin_gate_min) > float(margin_gate_max):
                                 raise ValueError("margin_gate_min must be <= margin_gate_max")
-                        settings.append(
-                            {
-                                "blank_bias": float(blank_bias),
-                                "nonblank_bias": float(nonblank_bias),
-                                "ratio_nonblank_bias": float(ratio_nonblank_bias),
-                                "margin_gate_min": (
-                                    None if margin_gate_min is None else float(margin_gate_min)
-                                ),
-                                "margin_gate_max": (
-                                    None if margin_gate_max is None else float(margin_gate_max)
-                                ),
-                            }
-                        )
+                        for adaptive_mode in cli.adaptive_modes:
+                            for adaptive_min_scale in cli.adaptive_min_scales:
+                                for adaptive_max_scale in cli.adaptive_max_scales:
+                                    for adaptive_short_pred_max_len in cli.adaptive_short_pred_max_lens:
+                                        settings.append(
+                                            {
+                                                "blank_bias": float(blank_bias),
+                                                "nonblank_bias": float(nonblank_bias),
+                                                "ratio_nonblank_bias": float(ratio_nonblank_bias),
+                                                "margin_gate_min": (
+                                                    None
+                                                    if margin_gate_min is None
+                                                    else float(margin_gate_min)
+                                                ),
+                                                "margin_gate_max": (
+                                                    None
+                                                    if margin_gate_max is None
+                                                    else float(margin_gate_max)
+                                                ),
+                                                "adaptive_mode": str(adaptive_mode),
+                                                "adaptive_min_scale": float(adaptive_min_scale),
+                                                "adaptive_max_scale": float(adaptive_max_scale),
+                                                "adaptive_short_pred_max_len": int(
+                                                    adaptive_short_pred_max_len
+                                                ),
+                                            }
+                                        )
     return settings
 
 
@@ -222,6 +269,10 @@ def main():
                     ratio_max=cli.ratio_max,
                     margin_gate_min=setting["margin_gate_min"],
                     margin_gate_max=setting["margin_gate_max"],
+                    adaptive_mode=setting["adaptive_mode"],
+                    adaptive_min_scale=setting["adaptive_min_scale"],
+                    adaptive_max_scale=setting["adaptive_max_scale"],
+                    adaptive_short_pred_max_len=setting["adaptive_short_pred_max_len"],
                 )
                 pred_labels = decode_greedy(calibrated_scores, len(dataset.charset))
                 pred_len = len(pred_labels)
@@ -240,7 +291,10 @@ def main():
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("Top decode-bias settings by CER:")
-    print("rank blank nonblank ratio_bias gate_min gate_max cer pred/gt empty del sub len1 len2 len11+")
+    print(
+        "rank blank nonblank ratio_bias gate_min gate_max adaptive min_scale max_scale short_len "
+        "cer pred/gt empty del sub len1 len2 len11+"
+    )
     for rank, row in enumerate(results[:20], start=1):
         bins = row["by_gt_len_bin"]
         print(
@@ -250,6 +304,10 @@ def main():
             f"{row['ratio_nonblank_bias']:.3f}",
             "none" if row["margin_gate_min"] is None else f"{row['margin_gate_min']:.3f}",
             "none" if row["margin_gate_max"] is None else f"{row['margin_gate_max']:.3f}",
+            row["adaptive_mode"],
+            f"{row['adaptive_min_scale']:.3f}",
+            f"{row['adaptive_max_scale']:.3f}",
+            row["adaptive_short_pred_max_len"],
             f"{row['cer_micro']:.6f}",
             f"{row['pred_gt_len_ratio']:.6f}",
             f"{row['empty_pred_rate']:.6f}",

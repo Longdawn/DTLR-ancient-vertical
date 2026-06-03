@@ -103,6 +103,98 @@ class CtcDecodingTest(unittest.TestCase):
 
         self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 1])
 
+    def test_apply_ctc_calibration_adaptive_empty_scales_bias(self):
+        pred_probs = torch.tensor(
+            [
+                [
+                    [0.55, 0.45],
+                    [0.90, 0.10],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        calibrated = apply_ctc_calibration(
+            pred_probs,
+            blank_bias=-0.6,
+            nonblank_bias=0.6,
+            adaptive_mode="empty",
+            adaptive_min_scale=0.0,
+            adaptive_max_scale=1.0,
+        )
+
+        self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 0])
+
+    def test_apply_ctc_calibration_adaptive_empty_preserves_nonempty_decode(self):
+        pred_probs = torch.tensor(
+            [
+                [
+                    [0.40, 0.60],
+                    [0.90, 0.10],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        calibrated = apply_ctc_calibration(
+            pred_probs,
+            blank_bias=-0.6,
+            nonblank_bias=0.6,
+            adaptive_mode="empty",
+            adaptive_min_scale=0.0,
+            adaptive_max_scale=1.0,
+        )
+
+        self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 0])
+
+    def test_apply_ctc_calibration_adaptive_pred_short_scales_short_decode(self):
+        pred_probs = torch.tensor(
+            [
+                [
+                    [0.55, 0.45],
+                    [0.90, 0.10],
+                    [0.90, 0.10],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        calibrated = apply_ctc_calibration(
+            pred_probs,
+            blank_bias=-0.6,
+            nonblank_bias=0.6,
+            adaptive_mode="pred_short",
+            adaptive_short_pred_max_len=1,
+            adaptive_min_scale=0.0,
+            adaptive_max_scale=1.0,
+        )
+
+        self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 0, 0])
+
+    def test_apply_ctc_calibration_adaptive_pred_short_preserves_long_decode(self):
+        pred_probs = torch.tensor(
+            [
+                [
+                    [0.40, 0.60, 0.00],
+                    [0.90, 0.10, 0.00],
+                    [0.40, 0.00, 0.60],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+
+        calibrated = apply_ctc_calibration(
+            pred_probs,
+            blank_bias=-0.6,
+            nonblank_bias=0.6,
+            adaptive_mode="pred_short",
+            adaptive_short_pred_max_len=1,
+            adaptive_min_scale=0.0,
+            adaptive_max_scale=1.0,
+        )
+
+        self.assertEqual(calibrated.argmax(-1)[0].tolist(), [1, 0, 2])
+
 
 class CtcMetricsTest(unittest.TestCase):
     def test_length_bin_boundaries(self):
