@@ -1,6 +1,6 @@
 # Paper Results Summary
 
-Last updated: 2026-06-03
+Last updated: 2026-06-04
 
 This table uses dataset-level micro metrics unless otherwise noted.
 
@@ -57,6 +57,23 @@ This table uses dataset-level micro metrics unless otherwise noted.
 | Bias effect on MTHv2-combo | Test CER improves from `4.47` to `3.90`; empty prediction rate improves from `3.68` to `1.04`. |
 | Bias effect on MTHv2-combo-qbudget | Test CER improves from `3.83` to `3.31`; empty prediction rate improves from `2.89` to `0.89`. |
 | Bias effect on HDRC | Test CER improves from `10.01` to `9.30`; empty prediction rate improves from `2.19` to `0.98`, mainly by reducing deletions. |
+| MMOCR SAR on MTHv2 | SAR-k3-768 val best reached `0.8084` 1-N.E.D, but test CER is `26.80` with Pred/GT `1.107`; main failure is insertion/repetition, so it is much weaker than CRNN/SVTR for this comparison. |
+
+## Dataset Detail Comparison (MTHv2 / HDRC / CHDAC)
+
+CHDAC is still an active finetuning run. Its rows below document dataset scale and current validation status only; it should not be treated as paper-ready until clean test, validation-selected bias, and test-bias summaries exist.
+
+| Dataset | Processed data | Loader / config | Train / valid / test samples | Total samples | Unique chars | Total chars | Valid length bins `1/2/3-5/6-10/11+` | Test length bins `1/2/3-5/6-10/11+` |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- | --- |
+| MTHv2-combo | `data/tkhmth2200_mth1000_dtlr` + `data/tkhmth2200_mth1200_dtlr` + `data/tkhmth2200_tkh_dtlr` | `dataset_file=mth_combo`, `config/MTHV2_dtlr.py` | `84176 / 10948 / 10455` | `105579` | `6727` | `1067699` | `1683 / 1264 / 1339 / 575 / 6087` | `1331 / 1032 / 1272 / 579 / 6241` |
+| HDRC | `data/hdrc_dtlr` | `dataset_file=mth1000`, `config/MTH1000_dtlr.py`, options `mth1000_root=hdrc_dtlr mth1000_raw_root=HDRC` | `24285 / 2854 / 3381` | `30520` | `4017` | `220396` | `510 / 590 / 563 / 290 / 901` | `628 / 789 / 747 / 289 / 928` |
+| CHDAC | `data/chdac_dtlr` | `dataset_file=mth1000`, `config/MTH1000_dtlr.py`, options `mth1000_root=chdac_dtlr mth1000_raw_root=CHDAC` | `39291 / 5968 / 4755` | `50014` | `10364` | `509997` | `810 / 721 / 1401 / 1055 / 1981` | `475 / 592 / 904 / 765 / 2019` |
+
+| Dataset | Current checkpoint / run | Current best validation status | Final test status | Notes |
+| --- | --- | --- | --- | --- |
+| MTHv2-combo-qbudget | `logs/mthv2_qbudgetstage1pre_mthv2_full_0603/checkpoint_best_regular.pth` | Valid bias `-2.0/0.8`: CER `3.76`, AR `96.24`, CR `96.45`. | Test bias `-2.0/0.8`: CER `3.31`, AR `96.69`, CR `96.90`, empty `0.89`, Pred/GT `0.997`. | Current strongest combined-data result; qbudget improves clean CER `3.83` to bias CER `3.31`. |
+| HDRC | `logs/mth1000mth1200pre_hdrcft_full_0527-1732/checkpoint_best_regular.pth` | Valid bias `-2.0/0.4`: CER `12.32`, AR `87.68`, CR `88.71`. | Test bias `-2.0/0.4`: CER `9.30`, AR `90.70`, CR `91.80`, empty `0.98`, Pred/GT `0.977`. | Harder domain; long columns remain the main weakness. |
+| CHDAC | `logs/chdac_qbudgetpre_full_0604` from `logs/chdac_qbudgetpre_head_0603_src6727/checkpoint_best_regular.pth` | Full finetune in progress. Latest logged valid epoch `1`: CER `43.91`, blank ratio `0.9933`; head-only best epoch `3`: CER `59.46`. | Pending. No clean test, validation bias sweep, or test-bias result yet. | Largest charset among these three (`10364` chars); many new chars relative to MTHv2 source, so classifier-head reconstruction is much weaker than prior datasets. |
 
 ## MMOCR Baseline Comparison (MTHv2-combo)
 
@@ -69,6 +86,7 @@ All rows below are from MMOCR runs on the same MTHv2-combo test set (`10455` sam
 | MMOCR | SVTR-small | `Rot90(k=3)` | test | 10455 | 4.66 | 95.34 | 95.44 | 0.9027 | 0.04 | 0.999 | 27.80 | 19.62 | 14.82 | 11.48 | 3.21 | `/home/ubuntu/mmocr/work_dirs/mthv2_svtr_small_k3_full_gpu1_0530-1424/best_recog_1-N.E.D_epoch_29.pth` | `/home/ubuntu/mmocr/work_dirs/eval_mthv2_svtr_small_k3_epoch29_test_0530/svtr_small_k3_epoch29_test_metrics.json` |
 | MMOCR | SVTR-L | `Rot90(k=3), 48x160` | test | 10455 | 4.84 | 95.16 | 95.26 | 0.9015 | 0.11 | 0.999 | 28.10 | 19.72 | 14.66 | 10.96 | 3.43 | `/home/ubuntu/mmocr/work_dirs/mthv2_svtr_large_k3_officialgeom_full_gpu1_0531-1653/best_recog_1-N.E.D_epoch_29.pth` | `/home/ubuntu/mmocr/work_dirs/eval_mthv2_svtr_large_k3_officialgeom_epoch29_test_0601/svtr_large_k3_officialgeom_epoch29_test_metrics.json` |
 | MMOCR | ABINet | `Rot90(k=3), 32x128` | test | 10455 | 9.25 | 90.75 | 90.91 | 0.8620 | 0.00 | 1.000 | 34.56 | 21.17 | 16.56 | 15.31 | 8.00 | `/home/ubuntu/mmocr/work_dirs/mthv2_abinet_k3_full_gpu1/best_recog_1-N.E.D_epoch_19.pth` | `/home/ubuntu/mmocr/work_dirs/eval_mthv2_abinet_k3_epoch19_test_0603_gpu/abinet_k3_epoch19_test_metrics.json` |
+| MMOCR | SAR | `Rot90(k=3), height=48, width=768` | test | 10455 | 26.80 | 73.20 | 87.65 | 0.7988 | 0.00 | 1.107 | 42.75 | 21.41 | 17.61 | 22.46 | 27.34 | `/home/ubuntu/mmocr/work_dirs/mthv2_sar_k3_768_20e_fresh_gpu1_0603_2115/best_recog_1-N.E.D_epoch_20.pth` | `/home/ubuntu/mmocr/work_dirs/eval_mthv2_sar_k3_768_epoch20_test_0604/sar_k3_epoch20_test_metrics.json` |
 | MMOCR | CRNN | `Rot90(k=1)` | test | 10455 | 27.26 | 72.74 | 73.81 | 0.6948 | 0.01 | 0.900 | 44.10 | 38.18 | 37.89 | 34.55 | 25.93 | `/home/ubuntu/mmocr/work_dirs/mthv2_crnn_vertical_full_gpu0_0529-2324/best_recog_1-N.E.D_epoch_28.pth` | `/home/ubuntu/mmocr/work_dirs/eval_mthv2_crnn_epoch28_test_0530/crnn_epoch28_test_metrics.json` |
 | MMOCR | SVTR-tiny | `Rot90(k=1)` | test | 10455 | 6.58 | 93.42 | 93.52 | 0.8805 | 0.02 | 0.997 | 31.40 | 21.90 | 17.94 | 13.86 | 5.02 | `/home/ubuntu/mmocr/work_dirs/mthv2_svtr_tiny_full_gpu0_0530-0220/best_recog_1-N.E.D_epoch_29.pth` | `/home/ubuntu/mmocr/work_dirs/eval_mthv2_svtr_tiny_epoch29_test_0530/svtr_tiny_epoch29_test_metrics.json` |
 
