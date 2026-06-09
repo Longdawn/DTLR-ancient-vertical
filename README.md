@@ -1,152 +1,69 @@
-<div align="center">
+# SAQT: Structure-Aware Query Learning for Vertical Historical Chinese Text Recognition
 
-<h1><a href="https://detection-based-text-line-recognition.github.io/">General Detection-based Text Line Recognition (DTLR)</a> <br>NeurIPS 2024</h1>
+This repository contains the implementation and experiment artifacts for **SAQT**, a structure-aware query learning framework for cropped vertical ancient Chinese text recognition. The project focuses on single-column / line-level recognition: given a cropped vertical text image, the model predicts the corresponding character sequence.
 
-<font size="4">
-<a href="https://raphael-baena.github.io/">Raphael Baena</a>&emsp;
-<a href="https://imagine-lab.enpc.fr/staff-members/syrine-kalleli/">Syrine Kalleli</a>&emsp;
-<a href="https://imagine.enpc.fr/~aubrym/">Mathieu Aubry</a>&emsp;
-</font>
-<br>
-<img src="figures/teaser.png">
-</div>
+SAQT uses character-localization supervision to learn structure-aware query representations, then converts vertically ordered query outputs into a CTC recognition sequence. For cross-dataset adaptation, the training pipeline supports charset-aware classifier initialization, CTC head reconstruction, full-model recognition finetuning, and development-set-fixed decoding calibration.
 
+## Scope
 
-## Description
+- Single-column / line-level vertical ancient text recognition.
+- Character boxes are used as training-time localization supervision when available.
+- Inference outputs a text sequence, not page regions or detected character boxes.
+- Experiments are reported with CER, AR, CR, empty prediction rate, predicted/ground-truth length ratio, and length-bucket metrics when available.
 
-This repository is the official implementation for [General Detection-based Text Line Recognition](https://detection-based-text-line-recognition.github.io/), 
-the paper is available on [arXiv](https://arxiv.org/pdf/2409.17095).
+This repository is not a page-level layout analysis, reading-order prediction, or document parsing system.
 
-This repository builds on the code for [DINO-DETR](https://github.com/IDEA-Research/DINO), the official implementation of the paper "[DINO: DETR with Improved DeNoising Anchor Boxes for End-to-End Object Detection](https://arxiv.org/abs/2203.03605)". We present a model that adapts DINO-DETR for text recognition as a detection and recognition task. The model is pretrained on synthetic data using the same loss as DINO-DETR and then fine-tuned on a real dataset with CTC loss.
-<p align="center">
-  <img src="figures/architecture.jpg">
-</p>
+## Main Entry Points
 
-## Content
-<details>
-<summary>Installation, Datasets, and Weights</summary>
+- `main_synthetic.py`: character-localization / query pretraining.
+- `finetuning.py`: classifier-head reconstruction and full CTC recognition finetuning.
+- `evaluation.py`: standalone evaluation entry point.
+- `engine.py`: shared training and evaluation loops.
 
+## SAQT Model And Configs
 
-## Installation, Datasets, and Weights
-### 1. Installation
-The model was trained with `python=3.11.0`, `pytorch=2.1.0`, `cuda=11.8` and builds on the DETR-variants [DINO](https://arxiv.org/abs/2203.03605)/[DN](https://arxiv.org/abs/2203.01305)/[DAB](https://arxiv.org/abs/2201.12329) and [Deformable-DETR](https://arxiv.org/abs/2010.04159).
+- `models/saqt/`: paper-facing SAQT model registration layer.
+- `models/dino/`: compatibility implementation layer for the query-based detector backbone and existing checkpoints.
+- `config/SAQT_MTHV2.py`: paper-facing MTHv2 recognition config.
+- `config/SAQT_HDRC.py`: paper-facing HDRC recognition config.
+- `config/MTHV2_stage1_query_budget.py`: query-budget localization pretraining config.
 
-1. Clone this repository and create a virtual environment
-2. Follow instructions to install a [Pytorch](https://pytorch.org/get-started/locally/) version compatible with your system and CUDA version
-3. Install other dependencies
-    ```bash
-    pip install -r requirements.txt
-    ```
-4. Compiling CUDA operators
-    ```bash
-    python models/dino/ops/setup.py build install # 'cuda not available', run => export CUDA_HOME=/usr/local/cuda-<version>
-    # unit test (should see all checking is True) # could output an outofmemory error
-    python models/dino/ops/test.py
-    ```
-### 2. Datasets
-Datasets should be placed in the appropriate folder specified in **datasets/config.json**. We preprocess the images and annotations for the IAM dataset, while all other datasets are used in their original form.
-For each dataset (except IAM), a charset file (.pkl) is required. Charset files can be found in the folder [data](data).
+The legacy `*_dtlr.py` configs remain for checkpoint compatibility and historical reproducibility. New paper-facing runs should prefer `SAQT_*` config names.
 
-**Handwritten**
-1. IAM: the official website is [here](http://www.fki.inf.unibe.ch/databases/iam-handwriting-database). We preprocess the images and annotation following the instruction in the [PyLai Repository](https://github.com/carmocca/PyLaia-examples/tree/master/iam-htr). The annotations are stored in [data/IAM_new/labels.pkl](data/IAM_new).
-2. RIMES: TEKLIA provide the dataset [here](https://teklia.com/research/rimes-database/). After downloading, place the charset file in the same folder as the dataset.
-3. READ: the dataset is available [here](https://zenodo.org/records/1297399). After downloading, place the charset file in the same folder as the dataset.
+## Data
 
-**Chinese**
-The official website is [here](https://nlpr.ia.ac.cn/databases/handwriting/Download.html). Images and annotations are provide only in bytes format for these datasets.
-1. CASIA v1: Download the dataset in bytes format with the link above and place the charset in the same folder as the dataset.
-2. CASIA v2: We provide directly a version of the dataset with images (PNG) and annotations (TXT). Download the dataset [here](https://drive.google.com/file/d/1ZfrsxBM2uhnqa0vps-8950ZFflYgMHin/view?usp=sharing).
+Processed line-level datasets are expected under `data/`, including:
 
-**Ciphers**
-The ciphers borg and copiale are available [here](https://pages.cvc.uab.es/abaro/datasets.html). The charset files are provided in the folder [data](data).
-### 3. Weights
-Pretrained checkpoints can be found [here](https://drive.google.com/file/d/1sr-CSCdiVhCuUmZa3danqSvdzIvj8Pdl/view?usp=sharing). The folder includes the weights of the following **pretrained** models:
+- `data/tkhmth2200_mth1000_dtlr/`
+- `data/tkhmth2200_mth1200_dtlr/`
+- `data/tkhmth2200_tkh_dtlr/`
+- `data/hdrc_dtlr/`
 
-- **General model**: Trained on random Latin characters. Typically used for finetuning on ciphers.
-- **English model**: Trained on English text with random erasing. Typically used for finetuning on IAM.
-- **French model**: Trained on French text with random erasing. Typically used for finetuning on RIMES.
-- **German model**: Trained on German text with random erasing. Typically used for finetuning on READ.
-- **Chinese model**: Trained on random handwritten Chinese characters from HWDB 1. Typically used for finetuning on HWDB 2.
+The `_dtlr` suffix is kept as a data-format compatibility name for existing preprocessing outputs.
 
-Finetuned checkpoints can be found [here](https://drive.google.com/file/d/11UXYJHBKhgI6DhhkqQ6UpHFRXt3XNFQA/view?usp=sharing).
+## Results And Logs
 
-Checkpoints should be organized as follows:
+- `logs/paper_results_summary.md`: consolidated paper metrics.
+- `logs/PAPER_RUNS.md`: paper-ready run manifest and archived-run policy.
+- `docs/paper-drafts/`: manuscript drafts, figures, and LaTeX package.
+- `debug_vis/`: box/query diagnostics and visualizations.
+
+Do not judge a run from training loss alone. Recognition results should include dataset-level CER/AR/CR and short-text behavior when available.
+
+## Minimal Verification
+
 ```bash
-  logs/
-    └── IAM/
-      └── checkpoint.pth
-    └── other_model/
-      └── checkpoint.pth
-    ...
-```
-</details> 
-<details>
-<summary>Pretraining</summary>
+python - <<'PY'
+from util.slconfig import SLConfig
+import models
 
-# Pretraining
-Pretraining scipts are available in **scripts/pretraining**.
-## Latin scripts 
-You need  to download the folder [resources](https://drive.google.com/file/d/1XxeizTec4XOsLfyV_Q_dVQ1rMNWzbmoO/view?usp=sharing) (background, fonts, noises, texts)  and place it in the folder **dataset**.
-
-To train models with random erasing:
-```bash
-sh scripts/pretraining/Synthetic_english_w_masking.sh
-sh scripts/pretraining/Synthetic_german_w_masking.sh
-sh scripts/pretraining/Synthetic_french_w_masking.sh
-sh scripts/pretraining/Synthetic_general.sh
-```
-## Chinese scripts 
-You need the dataset CASIA v1 [here]
-
-To train a model with random erasing
-```bash
-sh scripts/pretraining/Synthetic_english.sh
-```
-Then for instances to train a model for chinese with random erasing:
-```bash
-bash scripts/pretraining/Synthetic_chinese_w_masking.sh
-```
-</details> 
-<details>
-<summary>Finetuning</summary>
-
-# Finetuning
-Finetuning occurs in two stages. The scripts are available in **scripts/finetuning.**. For Step 1 it is expected that a model is pretrained is placed in the folder **logs/your_model_name**.
-
-</details> 
-<details>
-<summary>Evaluation</summary> 
-
-# Evaluation 
-Use the scripts in **scripts/evaluating** to evaluate the model on the different datasets. 
-
-</details> 
-<details>
-<summary>Ngram</summary>
-
-# Ngram
-## Evaluation
-We provide our N-gran models for RIMES, READ and IAM [here](https://drive.google.com/file/d/1vm8KlY5-tWKDh2VRfW_rk5kujDVDIy90/view?usp=sharing). We strongly advice to create a separate environment for the ngram model and to install the libraries in the [ngram/mini_guide.md](ngram/mini_guide.md).
-To run an evalutation with the ngram model:
-```bash
-bash python ngram/clean_gen_ngram_preds.py --config_path ngram/IAM.yaml
-bash python ngram/clean_gen_ngram_preds.py --config_path ngram/READ.yaml
-bash python ngram/clean_gen_ngram_preds.py --config_path ngram/RIMES.yaml
-```
-## Training a ngram model
-To train you own ngram model, follow the instructions in the [ngram/mini_guide.md](ngram/mini_guide.md)
-</details> 
-  
-## Citation
-
-If you find this code useful, don't forget to <b>star the repo :star:</b> and <b>cite the papers :point_down:</b>
-
-```                         
-@article{baena2024DTLR, title={General Detection-based Text Line Recognition}, 
-author={Raphael Baena and Syrine Kalleli and Mathieu Aubry}, 
-booktitle={NeurIPS},
-year={2024}},
-url={https://arxiv.org/abs/2409.17095},  
+cfg = SLConfig.fromfile("config/SAQT_MTHV2.py")
+print(cfg.modelname)
+PY
 ```
 
+For full training and evaluation commands, see `docs/EXPERIMENT_POSTPROCESS.md` and `logs/PAPER_RUNS.md`.
 
+## Acknowledgement
+
+SAQT builds on query-based detection and localization ideas, including DINO/Deformable-DETR components and the public DTLR codebase. The paper-facing contribution in this repository is the adaptation of structure-aware query learning to vertical ancient Chinese line recognition, including query-to-CTC recognition, charset-aware classifier adaptation, and the experiment protocol for MTHv2/HDRC.

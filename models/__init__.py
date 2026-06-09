@@ -5,6 +5,7 @@
 # ------------------------------------------------------------------------
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from .dino import build_dino
+from .saqt import build_saqt
 from .LM_model import SelfAttentionModel
 
 def build_model(args):

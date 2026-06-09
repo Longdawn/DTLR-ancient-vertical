@@ -1,0 +1,7 @@
+dataset,method,decode,AR,CR
+MTHv2,Best adapted STR,Rot90(k=3),95.56,95.68
+MTHv2,SAQT,clean,96.33,96.50
+MTHv2,SAQT,bias,96.75,97.00
+HDRC,Best adapted STR,Rot90(k=3),84.91,85.21
+HDRC,SAQT,clean,91.50,91.64
+HDRC,SAQT,bias,93.44,94.36

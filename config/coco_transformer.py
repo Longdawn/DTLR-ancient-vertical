@@ -5,4 +5,3 @@ data_aug_scales2_crop = [384, 600]
 
 
 data_aug_scale_overlap = None
-

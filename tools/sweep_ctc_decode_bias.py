@@ -113,6 +113,10 @@ def build_settings(cli):
 
     margin_gate_mins = cli.margin_gate_mins if cli.margin_gate_mins is not None else [None]
     margin_gate_maxs = cli.margin_gate_maxs if cli.margin_gate_maxs is not None else [None]
+    adaptive_modes = getattr(cli, "adaptive_modes", ["none"])
+    adaptive_min_scales = getattr(cli, "adaptive_min_scales", [1.0])
+    adaptive_max_scales = getattr(cli, "adaptive_max_scales", [1.0])
+    adaptive_short_pred_max_lens = getattr(cli, "adaptive_short_pred_max_lens", [2])
     settings = []
     for blank_bias in cli.blank_biases:
         for nonblank_bias in cli.nonblank_biases:
@@ -122,10 +126,10 @@ def build_settings(cli):
                         if margin_gate_min is not None and margin_gate_max is not None:
                             if float(margin_gate_min) > float(margin_gate_max):
                                 raise ValueError("margin_gate_min must be <= margin_gate_max")
-                        for adaptive_mode in cli.adaptive_modes:
-                            for adaptive_min_scale in cli.adaptive_min_scales:
-                                for adaptive_max_scale in cli.adaptive_max_scales:
-                                    for adaptive_short_pred_max_len in cli.adaptive_short_pred_max_lens:
+                        for adaptive_mode in adaptive_modes:
+                            for adaptive_min_scale in adaptive_min_scales:
+                                for adaptive_max_scale in adaptive_max_scales:
+                                    for adaptive_short_pred_max_len in adaptive_short_pred_max_lens:
                                         settings.append(
                                             {
                                                 "blank_bias": float(blank_bias),

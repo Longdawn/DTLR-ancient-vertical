@@ -24,6 +24,10 @@ class MTHCombo(Dataset):
             child_args.mth1000_raw_root = raw_root
             self.datasets.append(MTH1000(mode, transform, args=child_args))
 
+        self.samples = []
+        for dataset in self.datasets:
+            self.samples.extend(getattr(dataset, "samples", []))
+
         charset = set()
         for dataset in self.datasets:
             charset.update(dataset.charset)

@@ -74,6 +74,39 @@ class GlyphPrototypeBranchTest(unittest.TestCase):
         )
         self.assertFalse(model.glyph_prototype_table.weight.requires_grad)
 
+    def test_glyph_proto_aux_loss_selects_queries_from_base_char_probs(self):
+        pred_proto_logits = torch.tensor(
+            [
+                [
+                    [-1.0, -1.0, 4.0],
+                    [-1.0, 4.0, -1.0],
+                    [4.0, -1.0, -1.0],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        char_probs = torch.tensor(
+            [
+                [
+                    [0.10, 0.20, 0.90],
+                    [0.10, 0.90, 0.20],
+                    [0.90, 0.20, 0.10],
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        targets = [{"labels": torch.tensor([2, 1], dtype=torch.long)}]
+
+        loss, stats = self.dino_tool.compute_glyph_proto_aux_loss(
+            pred_proto_logits,
+            char_probs,
+            targets,
+        )
+
+        self.assertLess(loss.item(), 0.05)
+        self.assertEqual(stats["eligible_samples"], 1)
+        self.assertEqual(stats["selected_chars"], 2)
+
     def test_prototype_head_does_not_shift_baseline_sensitive_random_init(self):
         features_dim = 32
         num_classes = 8
@@ -206,6 +239,14 @@ class GlyphPrototypeConfigSmokeTest(unittest.TestCase):
         self.assertEqual(config.glyph_proto_fuse_coef, 0.1)
         self.assertEqual(config.glyph_proto_temperature, 1.0)
         self.assertTrue(config.glyph_proto_trainable)
+
+    def test_mthv2_proto_aux_config_sets_expected_flags(self):
+        config = load_module(ROOT / "config" / "MTHV2_dtlr_proto_aux.py")
+        self.assertTrue(config.use_glyph_prototype_head)
+        self.assertEqual(config.glyph_proto_dim, 256)
+        self.assertEqual(config.glyph_proto_fuse_coef, 0.0)
+        self.assertEqual(config.glyph_proto_aux_loss_coef, 0.01)
+        self.assertEqual(config.glyph_proto_aux_max_len, 0)
 
 
 if __name__ == "__main__":

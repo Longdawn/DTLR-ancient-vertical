@@ -1,12 +1,12 @@
 # Codex Handoff
 
-Last updated: 2026-06-03
+Last updated: 2026-06-09
 
 ## Project Goal
 
-This repository is used for DTLR-based vertical ancient Chinese text recognition experiments. The practical target is single-column / line-level recognition for vertical ancient text images. It is not a page-level layout-analysis project and should not be framed as detecting page regions, reading order, or full-document layout.
+This repository is used for SAQT vertical ancient Chinese text recognition experiments. The practical target is single-column / line-level recognition for vertical ancient text images. It is not a page-level layout-analysis project and should not be framed as detecting page regions, reading order, or full-document layout.
 
-The paper story currently being shaped is: use a structure-aware query/localization pretraining idea inspired by DTLR, then adapt it for vertical ancient text recognition with CTC finetuning, validation-selected decode calibration, and cross-dataset evaluation on MTH1000, MTH1200, TKH, MTHv2-combo, and HDRC. The writing should avoid explicitly branding the method as plain DTLR, but may say it is inspired by query-based detection/localization ideas.
+The paper story currently being shaped is: SAQT uses structure-aware query/localization pretraining, then adapts the query representation for vertical ancient text recognition with CTC finetuning, development-set-fixed decode calibration, and cross-dataset evaluation on MTHv2-combo and HDRC. Historical MTH1000, MTH1200, and TKH runs remain useful for provenance. The writing should present SAQT as the paper-facing method while acknowledging query-based detection/localization influences where appropriate.
 
 ## Current Code Structure
 
@@ -14,7 +14,8 @@ The paper story currently being shaped is: use a structure-aware query/localizat
 - `finetuning.py`: CTC head reconstruction and full recognition finetuning.
 - `evaluation.py`: standalone evaluation entry point.
 - `engine.py`: shared training and evaluation loops.
-- `models/dino/`: DINO/DTLR model, transformer, criterion, deformable attention.
+- `models/saqt/`: paper-facing SAQT model registration layer.
+- `models/dino/`: compatibility implementation layer for the query transformer, criterion, and deformable attention modules used by existing checkpoints.
 - `datasets/`: dataset builders and transforms.
 - `datasets/MTH1000.py`: MTH1000-style processed single-column line dataset.
 - `datasets/MTHCombo.py`: combined MTH1000/MTH1200/TKH dataset.
@@ -24,14 +25,16 @@ The paper story currently being shaped is: use a structure-aware query/localizat
 - `tools/sweep_ctc_decode_bias.py`: blank / nonblank decode calibration sweeps.
 - `tools/format_ctc_result_row.py`: formats completed CTC JSON results into Markdown/CSV paper table rows.
 - `tools/diagnose_boxes.py`: stage-1 query/box diagnostic.
-- `tools/export_mmocr_recog_dataset.py`: export DTLR data to MMOCR text-recognition format.
+- `tools/export_mmocr_recog_dataset.py`: export processed SAQT-compatible datasets to MMOCR text-recognition format.
 - `experiments/configs/mmocr/`: MMOCR comparison configs.
 - `PROJECT_MAP.md`: concise repository map.
 
 Important configs:
 
-- `config/MTH1000_dtlr.py`: main MTH1000/TKH/HDRC-style CTC finetuning config.
-- `config/MTHV2_dtlr.py`: MTHv2-combo CTC finetuning config.
+- `config/SAQT_MTHV2.py`: paper-facing MTHv2-combo CTC finetuning config.
+- `config/SAQT_HDRC.py`: paper-facing HDRC CTC finetuning config.
+- `config/MTH1000_dtlr.py`: legacy MTH1000/TKH/HDRC-style CTC finetuning config.
+- `config/MTHV2_dtlr.py`: legacy MTHv2-combo CTC finetuning config.
 - `config/MTHV2_stage1.py`: full MTHv2 stage-1 detection pretraining config.
 - `config/MTH1000_MTH1200_stage1.py`: trusted real stage-1 baseline.
 - `config/MTHV2_dtlr_sgq_short_ce.py`: SGQ short-query CE experiment.
@@ -72,7 +75,7 @@ Important data/log locations:
 
 Primary paper table is in `logs/paper_results_summary.md`.
 
-Best DTLR-style results currently summarized there:
+Best SAQT-style results currently summarized there:
 
 | Dataset | Decode | Test CER | Test AR | Test CR | Notes |
 | --- | --- | ---: | ---: | ---: | --- |
@@ -172,7 +175,7 @@ Current active DTLR full finetune:
 - HDRC remains harder, especially long columns.
 - Decode-time bias/calibration improves metrics but must be described carefully as validation-selected post-processing, not as a learned model module unless using the adaptive calibration code path.
 - Full-MTHv2 stage-1 over-activates nonblank queries in box diagnostics.
-- Long DTLR training should not be launched in a Codex foreground exec session; use `tmux`.
+- Long SAQT training should not be launched in a Codex foreground exec session; use `tmux`.
 
 ## Next Recommended Steps
 
@@ -236,5 +239,5 @@ MPLCONFIGDIR=/tmp/matplotlib PYTHONPATH=/home/ubuntu/DTLR /home/ubuntu/miniconda
 - Do not silently edit shared baseline configs. Prefer new config files or explicit `--options`.
 - Do not reuse interrupted/no-checkpoint runs as results.
 - Do not delete logs/checkpoints/datasets unless explicitly asked.
-- Do not present DTLR stage-1 character boxes as page-level detection. It is query/localization pretraining for line-level recognition.
+- Do not present SAQT stage-1 character boxes as page-level detection. It is query/localization pretraining for line-level recognition.
 - Do not claim a module is valid for the paper without clean/bias test results and length-bucket analysis.

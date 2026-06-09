@@ -13,7 +13,7 @@ from util import box_ops
 import editdistance
 import re   
 parser = argparse.ArgumentParser()
-parser.add_argument("--dataset", type=str, default="IAM")
+parser.add_argument("--dataset", type=str, default="mth_combo")
 parser.add_argument("--mode", type=str, default="val")
 parser.add_argument("--new_class_embedding",  action="store_true")
 parser.add_argument("--new_label_enc",  action="store_true")
@@ -21,7 +21,7 @@ parser.add_argument("--NMS_inference",  action="store_true")
 parser.add_argument("--metrics",  type=str, default="default")
 parser.add_argument("--unicode",  action="store_true")
 parser.add_argument("--weights", type=str, default="checkpoint.pth")
-parser.add_argument("--config", type=str, default="config/Latin_CTC.py")
+parser.add_argument("--config", type=str, default="config/SAQT_MTHV2.py")
 parser.add_argument("--fix_enc_out_class", action="store_true")
 parser.add_argument("--TH", type=float, default=None)
 parser.add_argument("--NMS", type=float, default=None)
@@ -568,36 +568,12 @@ if __name__ == "__main__":
                         print("An error occurred affecting the metrics computation")
                         continue
                     cer_it, dict_char, div, predicted_labels = compute_cer_impact(output, [targets], dataset_val.charset, dict_char, TH=TH, NM=NM)
-                    if args.unicode:
-                        list_preds_str.append(_labels_to_text(predicted_labels, dataset_val.charset))
-                        list_gt_str.append(_labels_to_text(targets['labels'], dataset_val.charset))
-                    else:
-                        if args.dataset in [ "IAM", "RIMES", "READ"]:
-                            preds_str = _labels_to_text(predicted_labels, dataset_val.charset)
-                            gt_str = _labels_to_text(targets['labels'], dataset_val.charset)
-                            list_preds_str.append(preds_str)
-                            list_gt_str.append(gt_str)
-                        else:
-                            list_preds_str.append(_labels_to_text(predicted_labels, dataset_val.charset))
-                            list_gt_str.append(_labels_to_text(targets['labels'], dataset_val.charset))
+                    list_preds_str.append(_labels_to_text(predicted_labels, dataset_val.charset))
+                    list_gt_str.append(_labels_to_text(targets['labels'], dataset_val.charset))
                     
                     dist_txt = editdistance.eval(list_gt_str[-1], list_preds_str[-1])
                     cer_txt = dist_txt / max(len(list_gt_str[-1]), 1)
                     CER_txt.append(cer_txt)
-                    if args.dataset in [ "IAM", "RIMES", "READ"]:
-                        process_gt = process_pred_string(list_gt_str[-1])
-                        process_pred = process_pred_string(list_preds_str[-1])
-                        dist_it = editdistance.eval(process_gt, process_pred)
-                        list_dist.append(dist_it)
-
-
-                        list_length_gt.append(len(process_gt))
-                        cer_it = sum(list_dist) / sum(list_length_gt) #DAN CER
-                        #cer_it = np.mean(np.array(list_dist) / np.array(list_length_gt))
-                        gt_split = split_labels_into_words([int(item) for item in targets["labels"]], dataset_val.charset)
-                        pred_split = split_labels_into_words(predicted_labels, dataset_val.charset)
-                        wer_it = word_error_rate(gt_split, pred_split)
-
 
 
 

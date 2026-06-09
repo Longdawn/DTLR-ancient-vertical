@@ -268,7 +268,7 @@ def main():
     if cli.force_pytorch_msda:
         os.environ["DTLR_MSDA_FORCE_PYTORCH"] = "1"
     args = load_cfg_to_args(cli)
-    split = cli.split if args.dataset_file == "IAM" else ("valid" if cli.split == "val" else cli.split)
+    split = "valid" if cli.split == "val" else cli.split
     device = torch.device(cli.device if torch.cuda.is_available() and "cuda" in cli.device else "cpu")
     checkpoint_path = resolve_checkpoint(cli.checkpoint)
     output_dir = make_output_dir(cli, checkpoint_path)

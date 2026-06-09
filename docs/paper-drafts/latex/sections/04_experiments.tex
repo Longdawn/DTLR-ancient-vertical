@@ -1,0 +1,29 @@
+\section{Experimental Setup}
+
+\subsection{Datasets}
+
+We evaluate SAQT on two vertical ancient-text recognition datasets, MTHv2 and HDRC. All experiments take cropped line-level or single-column images as input and predict the corresponding character sequence.
+
+MTHv2 consists of three subsets and provides 105,579 vertical ancient-text single-column images in total~\cite{tang2020hrcenternet}. We unify the three subsets into a single recognition task for training and evaluation. During character-localization information learning, available character-level position annotations are additionally used as localization supervision after sorting boxes along the vertical direction.
+
+HDRC comes from the ICDAR 2019 Historical Document Reading Challenge on Large Structured Chinese Family Records~\cite{saini2019hdrc}. The dataset provides PAGE-XML annotations. We construct line-level vertical recognition samples from text-line regions and Unicode transcriptions. To reduce the risk of samples from the same page appearing in both training and testing, HDRC is split by page groups. The train/validation/test splits contain 936/113/123 pages and 24,285/2,854/3,381 line samples. The charsets of MTHv2 and HDRC contain 6,727 and 4,017 characters, respectively.
+
+\subsection{Baselines}
+
+We compare SAQT with several scene text recognition baselines adapted to vertical input through MMOCR: CRNN, SVTR, ABINet, and SAR. Since these recognizers are designed for horizontal text by default, we rotate vertical single-column images at the input side so that their reading direction matches the expected model orientation. On MTHv2, the baselines include CRNN, SVTR-tiny, SVTR-small, SVTR-L, ABINet, and SAR. On HDRC, they include CRNN, SVTR-tiny, SVTR-L, ABINet, and SAR. All baseline outputs are converted to the same micro AR/CR evaluation protocol used for SAQT.
+
+All baselines use dataset-specific MMOCR charsets and the same train/validation/test annotations. No external text corpus is used. Vertical images are rotated with \texttt{Rot90(k=3)}. CRNN uses height 32 and variable width up to 2048. SVTR-tiny, SVTR-small, and SVTR-L use the corresponding MMOCR configurations, with SVTR-L following the official 48$\times$160 geometry. ABINet uses 32$\times$128 input, and SAR uses padded images of height 48 and width 768. CRNN and SVTR variants are trained for 30 epochs; ABINet and SAR are trained for 20 epochs. Checkpoints are selected by validation \texttt{1-N.E.D}, and test predictions are then converted to AR/CR.
+
+\subsection{Metrics}
+
+We report accuracy rate (AR) and correct rate (CR). Let $S$, $D$, and $I$ denote substitution, deletion, and insertion errors, and let $N$ denote the number of ground-truth characters:
+\begin{equation}
+AR=1-\frac{S+D+I}{N},\qquad
+CR=1-\frac{S+D}{N}.
+\end{equation}
+
+\subsection{Implementation Details}
+
+SAQT uses a DINO-style detection transformer as the structure-query backbone. The visual backbone is ResNet-50. Both Transformer encoder and decoder contain 6 layers, with hidden dimension 256, 8 attention heads, and 900 queries. Character-localization information learning uses character-box supervision and DETR-style matching losses. The MTHv2 query-budget setting is trained for 6 epochs, with learning rate $1\times 10^{-4}$, backbone learning rate $1\times 10^{-5}$, batch size 2, and weight decay $1\times 10^{-4}$. The query-budget coefficient is 0.01.
+
+For downstream recognition, query outputs are sorted by vertical position and organized as a CTC sequence. If the target charset differs from the reference charset associated with the localization-aware query representation, the classifier head is reconstructed before full-model recognition training. Shared characters inherit classifier weights, while new characters are initialized from unused classifier rows. Head reconstruction is trained for 3 epochs with learning rate $1\times 10^{-4}$. Full-model recognition training then continues for 12 epochs with learning rate $1\times 10^{-5}$. Both stages use AdamW, batch size 2, weight decay $1\times 10^{-4}$, and random seed 42. Model checkpoints are determined by development-set recognition results. Blank/nonblank calibration biases are determined on the development split and then fixed for testing; the test set is used only for final AR/CR reporting. The calibration introduces no language model or external text data. Experiments are conducted on NVIDIA RTX 3090 GPUs.

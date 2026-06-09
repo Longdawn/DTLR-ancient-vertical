@@ -1,6 +1,276 @@
 # MTHv2/HDRC Goal Status
 
-Last updated: 2026-06-03 22:53 Asia/Shanghai
+Last updated: 2026-06-08 14:10 Asia/Shanghai
+
+## Latest Update 2026-06-08 HDRC Count001 Full Finetune Started
+
+Started the matched HDRC qbudget-localization-query full-finetuning ablation with the conservative CTC expected-count auxiliary loss.
+
+- Evidence status: `newly_run` launch; validation/test results pending.
+- tmux session: `hdrc_qbudget_count001_full_0608`
+- Log dir: `logs/hdrc_qbudget_full_ctc_count001_0608`
+- New config: `config/HDRC_dtlr_ctc_count001.py`
+- Launch script: `logs/hdrc_qbudget_full_ctc_count001_0608/run_full_ctc_count001_0608.sh`
+- Source checkpoint: `logs/hdrc_qbudget_head_0607/checkpoint_best_regular.pth`
+- Old charset for smart mapping: `logs/mthv2_stage1_qbudget_from_mth1000mth1200_gpu0_0602/charset.pkl`
+- Added loss setting: `ctc_count_loss_coef=0.01`, `ctc_count_loss_short_weight=3.0`
+- GPU policy: launched on physical GPU0 only.
+
+Monitoring note:
+
+- Compare early validation against matched HDRC qbudget baseline `logs/hdrc_qbudget_full_0607`, whose best clean valid CER was epoch 1 at `0.09598421694989437`.
+- If epoch 1/2 is clearly worse and the run starts degrading, stop after a best checkpoint exists and postprocess the best checkpoint instead of waiting blindly for epoch 11.
+
+## Latest Update 2026-06-08 HDRC Count001 Epoch 0 Validation
+
+`logs/hdrc_qbudget_full_ctc_count001_0608` has completed epoch 0 validation and saved `checkpoint_best_regular.pth`.
+
+- Evidence status: `newly_run` validation.
+- Epoch 0 clean valid CER: `0.11090679381160409`
+- Epoch 0 blank prediction ratio: `0.9923374830381638`
+- Matched HDRC qbudget baseline epoch 0 clean valid CER: `0.14358088772993394`
+- Matched HDRC qbudget baseline best clean valid CER: epoch 1 at `0.09598421694989437`
+
+Decision:
+
+- Continue through epoch 1, because count001 is stronger than the matched baseline at epoch 0 but has not yet beaten the baseline's epoch-1 best.
+
+## Latest Update 2026-06-08 HDRC Count001 Stopped After Epoch 1 Regression
+
+Stopped `logs/hdrc_qbudget_full_ctc_count001_0608` after epoch 1 validation showed severe regression.
+
+- Evidence status: `newly_run` stopped run.
+- Stop action: sent `C-c` to tmux session `hdrc_qbudget_count001_full_0608`.
+- GPU0 status after stop: released.
+- Best checkpoint remains epoch 0:
+  - `logs/hdrc_qbudget_full_ctc_count001_0608/checkpoint_best_regular.pth`
+  - timestamp: `2026-06-08 14:35:50 +0800`
+- Epoch 1 clean valid CER: `0.40783941818759867`
+- Epoch 1 blank prediction ratio: `0.9978323007431913`
+- Expected count collapsed relative to target count:
+  - `test_ctc_expected_count_unscaled=4.201538533948038`
+  - `test_ctc_target_count_unscaled=7.420812894183602`
+
+Decision:
+
+- Do not treat `ctc_count_loss_coef=0.01` as an HDRC-positive module.
+- Keep the MTHv2 count001 result as a modest dataset-specific positive ablation unless a better cross-dataset setting is found.
+- No update to `logs/paper_results_summary.md` yet, because this stopped run has not gone through final clean/test/bias postprocess and is not a paper-facing positive result.
+
+## Latest Update 2026-06-08 MTHv2 Pred-Short Adaptive Decode Sweep
+
+Started a GPU0-only full validation sweep for the `pred_short` adaptive decode calibration module on top of the current MTHv2 qbudget-count001 checkpoint.
+
+- Evidence status: `newly_run` launch; full validation result pending.
+- Smoke result on first 1000 validation samples:
+  - fixed qbudget-count001 bias `blank=-2.0`, `nonblank=0.8`: CER `0.050274`
+  - `pred_short`, `adaptive_max_scale=1.2`, `adaptive_short_pred_max_len=1`: CER `0.050013`
+  - signal is tiny but directionally positive; full validation is needed before any conclusion.
+- tmux session: `mthv2_pred_short_valid_full_0608`
+- Script: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/run_pred_short_valid_full_0608.sh`
+- Output JSON: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/pred_short_sweep_valid_full_0608.json`
+- Output log: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/pred_short_sweep_valid_full_0608.out`
+- Checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/checkpoint_best_regular.pth`
+- GPU policy: physical GPU0 only.
+
+Decision rule:
+
+- If full validation does not improve over the fixed `-2.0/0.8` setting, keep `pred_short` as a negative/internal decode module.
+- If full validation improves overall CER without worsening len=1/len=2 substantially, apply the selected adaptive setting once to MTHv2 test and then repeat validation-only smoke on HDRC.
+
+## Latest Update 2026-06-08 MTHv2 Pred-Short Adaptive Decode Result
+
+Completed full validation and validation-selected test application for `pred_short` adaptive decode calibration on MTHv2 qbudget-count001.
+
+- Evidence status: `newly_run` validation + test application.
+- Validation fixed bias `-2.0/0.8`: CER `0.03719652114790787`, empty `0.006211180124223602`, Pred/GT `0.9972520468001926`.
+- Validation selected adaptive setting:
+  - `adaptive_mode=pred_short`
+  - `adaptive_max_scale=1.2`
+  - `adaptive_short_pred_max_len=2`
+  - CER `0.03709264662832753`, empty `0.003288271830471319`, Pred/GT `0.9980358272661171`
+- Test fixed bias `-2.0/0.8`: CER `0.032316280635478714`, AR `0.9676837193645212`, CR `0.9701242718083465`, empty `0.006791009086561454`.
+- Test selected adaptive setting: CER `0.03226017598159767`, AR `0.9677398240184023`, CR `0.9701897272378744`, empty `0.00392156862745098`.
+- Test length buckets:
+  - len=1 CER: fixed `0.2644628099173554` -> adaptive `0.2622088655146506`
+  - len=2 CER: fixed `0.1875` -> adaptive `0.187015503875969`
+  - len>=11 CER: unchanged `0.016691684813632424`
+
+Decision:
+
+- The effect is directionally positive but extremely small, so do not add it to the main paper table yet.
+- Next step is HDRC validation-only replication with the same `pred_short` idea. If HDRC does not improve, keep this as an internal decode analysis rather than a method contribution.
+
+## Latest Update 2026-06-08 HDRC Pred-Short Adaptive Decode Check
+
+Completed HDRC validation-only replication for `pred_short` adaptive decode calibration using the HDRC qbudget checkpoint.
+
+- Evidence status: `newly_run` validation-only check.
+- Checkpoint: `logs/hdrc_qbudget_full_0607/checkpoint_best_regular.pth`
+- Output JSON: `logs/hdrc_qbudget_full_0607/pred_short_valid_selected_0608.json`
+- Fixed HDRC qbudget bias `blank=-2.0`, `nonblank=1.0`:
+  - CER `0.07842716430306309`
+  - empty `0.006657323055361947`
+  - Pred/GT `0.987156944655169`
+- `pred_short`, `adaptive_max_scale=1.2`, `adaptive_short_pred_max_len=2`:
+  - CER `0.07847419188628508`
+  - empty `0.005605956552207428`
+  - Pred/GT `0.9883379767221734`
+
+Decision:
+
+- `pred_short` adaptive decode is not a cross-dataset positive module: it gives a tiny MTHv2 gain but slightly hurts HDRC validation CER.
+- Do not add it to `logs/paper_results_summary.md` or the main method narrative.
+- The stronger paper-facing story remains qbudget localization-query transfer + charset-aware classifier adaptation + full recognition finetuning + fixed validation-selected decode calibration.
+
+## Latest Update 2026-06-07 MTHv2 Head-Only Postprocess Completed
+
+MTHv2 head reconstruction vs full finetuning evidence is now closed.
+
+- Head-only run: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603`
+- Checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- Clean valid/test:
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/micro_valid_clean_0607.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/micro_test_clean_0607.json`
+- Validation sweep:
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/decode_bias_sweep_valid_0607.json`
+  - selected bias: `blank=-0.8`, `nonblank=1.0`
+- Test bias:
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/micro_test_bias_bm08_nb10_0607.json`
+
+Metrics:
+
+- Head-only clean test AR/CR: `93.00 / 93.42`
+- Head-only bias test AR/CR: `93.83 / 95.03`
+- Full-finetuning reference bias test AR/CR: `96.69 / 96.90`
+
+Paper updates:
+
+- Added MTHv2 head-only rows to `logs/paper_results_summary.md` and `logs/paper_results_summary.csv`.
+- Updated `docs/paper-drafts/97_experiment_evidence_inventory.md`.
+- Updated `docs/paper-drafts/05_results_analysis.md` and `docs/paper-drafts/latex/sections/05_results.tex` so the head reconstruction vs full finetuning table now covers both MTHv2 and HDRC.
+- Reworded the main Method/Experimental Setup drafts to emphasize character-localization learning instead of pretraining/stage naming.
+- Added `docs/paper-drafts/102_ccfb_evidence_and_model_roadmap.md` to consolidate the current CCF-B evidence judgment, remaining experiments, and the most defensible model-modification direction.
+- Updated `docs/paper-drafts/99_icdar_ccfb_readiness_audit.md` and `docs/paper-drafts/94_submission_gate_checklist.md` so they reflect the completed MTHv2 head-only postprocess and the running HDRC qbudget-localization-query head experiment.
+
+## Latest Update 2026-06-07 HDRC QBudget Head Started
+
+HDRC qbudget-localization-query head reconstruction has started on GPU0 only.
+
+- tmux session: `hdrc_qbudget_head_0607`
+- PID observed: `1817808`
+- Log dir: `logs/hdrc_qbudget_head_0607`
+- Source localization checkpoint:
+  - `logs/mthv2_stage1_qbudget_from_mth1000mth1200_gpu0_0602/checkpoint.pth`
+- Source charset:
+  - `logs/mthv2_stage1_qbudget_from_mth1000mth1200_gpu0_0602/charset.pkl`
+- Command uses:
+  - `CUDA_VISIBLE_DEVICES=0`
+  - `--device cuda:0`
+  - `dataset_file=mth1000`
+  - `mth1000_root=hdrc_dtlr`
+  - `mth1000_raw_root=HDRC`
+  - `num_classes=6727`
+  - `epochs=3`
+
+Initial status:
+
+- Process is alive and training.
+- GPU check after launch: GPU0 about `18562 MiB`, high utilization; GPU1 still occupied by the unrelated PaddleOCR HDRC SVTRv2 run.
+- `info.txt` reached epoch 0 training step `170/12142` by `2026-06-07 01:41:21`.
+
+Decision rule:
+
+- Wait for head validation results.
+- If validation CER is clearly worse than the existing HDRC head-only reference final-protocol clean valid CER `20.56`, do not launch full finetuning.
+- If close or better, launch `hdrc_qbudget_full_0607` on GPU0 only.
+
+## Latest Update 2026-06-05 HDRC Charset Ablation Postprocess Completed
+
+Gate D is now closed for HDRC.
+
+- Random-head full run: `logs/hdrc_charset_random_full_visible1_0605`
+- Checkpoint: `logs/hdrc_charset_random_full_visible1_0605/checkpoint_best_regular.pth`
+- Clean valid/test:
+  - `logs/hdrc_charset_random_full_visible1_0605/micro_valid_clean_0605.json`
+  - `logs/hdrc_charset_random_full_visible1_0605/micro_test_clean_0605.json`
+- Validation sweep:
+  - `logs/hdrc_charset_random_full_visible1_0605/decode_bias_sweep_valid_0605.json`
+  - selected bias: `blank=-1.2`, `nonblank=1.0`
+- Test bias:
+  - `logs/hdrc_charset_random_full_visible1_0605/micro_test_bias_b-12_nb10_0605.json`
+
+Metrics:
+
+- Random-head clean test AR/CR: `81.01 / 81.41`
+- Random-head bias test AR/CR: `82.72 / 83.97`
+- Charset-aware reference clean test AR/CR: `89.99 / 90.33`
+- Charset-aware reference bias test AR/CR: `90.70 / 91.80`
+
+Paper updates:
+
+- Added charset-adaptation ablation to `docs/paper-drafts/05_results_analysis.md`.
+- Added the same table to `docs/paper-drafts/latex/sections/05_results.tex`.
+- Updated `logs/paper_results_summary.md`, `logs/paper_results_summary.csv`, `docs/paper-drafts/97_experiment_evidence_inventory.md`, `docs/paper-drafts/94_submission_gate_checklist.md`, and `docs/paper-drafts/99_icdar_ccfb_readiness_audit.md`.
+
+## Latest Update 2026-06-05 Gate C/D Running Status
+
+Gate C and Gate D are still not paper-ready, but both runs progressed.
+
+- MTHv2 no-structure CTC:
+  - log dir: `logs/mthv2_no_structure_ctc_full_0605`
+  - PID: `1148725`
+  - epoch 0 validation completed
+  - epoch 0 `cer_oracle_direction=83.19721807791322`
+  - epoch 0 `test_blank_pred_ratio_unscaled=0.0`
+  - current status: training epoch 1
+  - interpretation: early behavior is a very weak conservative lower-bound control; do not enter the paper table until final clean/test and bias results exist.
+- HDRC random-head full finetuning:
+  - log dir: `logs/hdrc_charset_random_full_visible1_0605`
+  - PID: `1185006`
+  - current status: training epoch 0
+  - no validation row, checkpoint, clean/test JSON, decode-bias sweep, or final AR/CR exists yet.
+
+## Latest Update 2026-06-05 HDRC Random-Head Full Finetuning Started
+
+Gate D charset-adaptation ablation progressed from queued to running.
+
+- Random-head head reconstruction completed epoch 2:
+  - log dir: `logs/hdrc_charset_random_head_visible1_0605`
+  - epoch 2 `cer_oracle_direction=0.21498245980988`
+  - epoch 2 `test_loss=1.1785856355327562`
+- Matched random-head full finetuning started automatically:
+  - PID: `1185006`
+  - log dir: `logs/hdrc_charset_random_full_visible1_0605`
+  - command source: waiter PID `1145732`
+- No full-finetuning validation result, clean/test JSON, decode-bias sweep, or final test AR/CR exists yet.
+
+Next:
+
+- Let `logs/hdrc_charset_random_full_visible1_0605` finish.
+- Then run the clean valid/test evaluation, validation bias sweep, fixed-bias test, and update paper result artifacts.
+
+## Latest Update 2026-06-05 HDRC Random-Head Full Finetuning Queued
+
+Gate D charset-adaptation ablation progressed.
+
+- Random-head head reconstruction log dir: `logs/hdrc_charset_random_head_visible1_0605`
+- Best head checkpoint now exists:
+  - `logs/hdrc_charset_random_head_visible1_0605/checkpoint_best_regular.pth`
+- Epoch 0 validation record:
+  - `cer_oracle_direction=0.318392610944861`
+  - `test_loss=2.2556434856843888`
+  - `test_blank_pred_ratio_unscaled=0.9937016520996401`
+- The head reconstruction process is still running under PID `1125862`, currently continuing later epochs.
+- A tmux waiter has been launched:
+  - session/process command: `hdrc_charset_random_full_wait_0605`
+  - behavior: wait until PID `1125862` exits, verify the best head checkpoint exists, then launch matched full finetuning on physical GPU1 exposed as logical `cuda:0`.
+- Queued full finetuning output dir:
+  - `logs/hdrc_charset_random_full_visible1_0605`
+
+Next:
+
+- After `logs/hdrc_charset_random_full_visible1_0605` starts and finishes, run the clean valid/test evaluation, validation bias sweep, fixed-bias test, then update `logs/paper_results_summary.md`, `docs/paper-drafts/97_experiment_evidence_inventory.md`, and only then `docs/paper-drafts/05_results_analysis.md`.
 
 ## Resume Rule
 
@@ -117,6 +387,27 @@ HDRC baseline:
 - clean valid summary: `logs/mth1000mth1200pre_hdrcft_full_0527-1732/ctc_error_summary_valid_clean_0527.json`
 
 ## Latest Update 2026-05-28 23:58 Asia/Shanghai
+
+## Latest Update 2026-06-05 01:29 Asia/Shanghai
+
+Launched the first paper-critical ablation for ICDAR/CCF-B readiness: HDRC charset-adaptation random-head control.
+
+- tmux session: `hdrc_charset_random_head_0605`
+- log dir: `logs/hdrc_charset_random_head_0605`
+- device: `cuda:1`
+- purpose: compare against smart-mapping HDRC head reconstruction (`logs/mth1000mth1200pre_hdrcft_head_0527-1530`) to isolate the effect of character-table-aware classifier initialization.
+- command:
+
+```bash
+tmux new-session -d -s hdrc_charset_random_head_0605 'cd /home/ubuntu/DTLR && MPLCONFIGDIR=/tmp/matplotlib PYTHONPATH=/home/ubuntu/DTLR /home/ubuntu/miniconda3/envs/DTLR/bin/python finetuning.py --device cuda:1 --dataset_file mth1000 --num_workers 0 --resume logs/mth1000_mth1200_stage1_0512-1755/checkpoint.pth --new_class_embedding --path_old_charset data/tkhmth2200_mth1000_mth1200_charset.pkl --save_log --output_dir logs/hdrc_charset_random_head_0605 -c config/MTH1000_dtlr.py --options mth1000_root=hdrc_dtlr mth1000_raw_root=HDRC mth1000_image_ext=jpg num_classes=6700 batch_size=2 lr=1e-4 epochs=3 eval_epoch=1 max_iterations=10000'
+```
+
+Startup check:
+
+- `logs/hdrc_charset_random_head_0605/info.txt` exists.
+- parsed args show `smart_mapping=False`, `new_class_embedding=True`, `resume_finetuning=False`.
+- GPU1 process PID observed: `1116926`.
+- next step after head finishes: launch matching full finetune from `logs/hdrc_charset_random_head_0605/checkpoint_best_regular.pth`, then run clean AR/CR evaluation, validation bias sweep, and fixed-bias test evaluation.
 
 ## Latest Update 2026-05-30 17:35 Asia/Shanghai
 
@@ -6239,7 +6530,60 @@ Updated:
 
 - `logs/paper_results_summary.md`
 - `logs/paper_results_summary.csv`
+
+## Latest Update 2026-06-04 CHDAC Long Head Reconstruction Launched
+
+Launched a longer CHDAC classifier-head reconstruction run to test whether the weak CHDAC transfer result is limited by insufficient head adaptation.
+
+- tmux session: `chdac_head_long_0604`
+- Output dir: `logs/chdac_qbudgetpre_head_long_0604_src6727`
+- Source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_full_0603/checkpoint_best_regular.pth`
+- Old charset: `logs/mthv2_stage1_qbudget_from_mth1000mth1200_gpu0_0602/charset.pkl`
+- Target data: `data/chdac_dtlr`
+- Config: `config/MTH1000_dtlr.py`
+- Key options: `num_classes=6727`, `batch_size=2`, `lr=1e-4`, `epochs=12`, `eval_epoch=1`, `max_iterations=10000`
+
+Rationale:
+
+- Previous CHDAC head reconstruction (`logs/chdac_qbudgetpre_head_0603_src6727`) improved through epoch 3 and stopped at valid CER `59.46`, so this run extends the same setup to check whether head adaptation continues improving.
+
+Next:
+
+- Monitor validation CER after each epoch.
+- If head valid CER improves meaningfully below the prior `59.46`, use the best checkpoint for a new conservative full finetune.
 - `experiments/notes/mthv2_qbudget_full_0603_analysis.md`
+
+## Latest Update 2026-06-04 CHDAC Full Finetune Completed
+
+Completed CHDAC full finetune postprocess for:
+
+- Run: `logs/chdac_qbudgetpre_full_0604`
+- Best checkpoint: `logs/chdac_qbudgetpre_full_0604/checkpoint_best_regular.pth`
+- Clean valid/test: `logs/chdac_qbudgetpre_full_0604/micro_valid_clean_0604.json`, `logs/chdac_qbudgetpre_full_0604/micro_test_clean_0604.json`
+- Validation sweep: `logs/chdac_qbudgetpre_full_0604/decode_bias_sweep_valid_0604.json`
+- Test bias result: `logs/chdac_qbudgetpre_full_0604/micro_test_bias_b-12_nb10_0604.json`
+
+Selected validation setting:
+
+- Bias: `blank=-1.2`, `nonblank=1.0`
+- Valid CER/AR/CR: `49.85 / 50.15 / 53.18`
+
+Test metrics:
+
+- Clean test CER/AR/CR: `46.00 / 54.00 / 55.54`
+- Bias test CER/AR/CR: `44.22 / 55.78 / 60.50`
+- Bias empty pred: `4.00`
+- Bias Pred/GT length ratio: `0.836`
+
+Assessment:
+
+- Weak result, not paper-ready.
+- Main failure remains deletion/under-prediction despite decode-time bias.
+
+Updated:
+
+- `logs/paper_results_summary.md`
+- `logs/paper_results_summary.csv`
 
 ## Latest Update 2026-06-03 Query-Budget MTHv2 Valid Clean Metrics
 
@@ -6270,6 +6614,230 @@ Updated:
 - `logs/paper_results_summary.md`
 - `logs/paper_results_summary.csv`
 - `experiments/notes/mthv2_qbudget_full_0603_analysis.md`
+
+## Latest Update 2026-06-06 PaddleOCR HDRC SVTRv2 GPU Move
+
+Interrupted the unfinished PaddleOCR HDRC SVTRv2 MultiScaleSampler run on GPU0 and removed its partial output directory:
+
+- removed: `/home/ubuntu/PaddleOCR/output/rec/hdrc_svtrv2_rot90_ms_w1024_gpu0`
+
+Relaunched the same run on GPU1:
+
+- tmux session: `ppocr_hdrc_svtrv2_ms_gpu1`
+- command core: `CUDA_VISIBLE_DEVICES=1 /home/ubuntu/miniconda3/envs/ppocr/bin/python tools/train.py -c configs/rec/hdrc_svtrv2_rot90_ms_w1024.yml`
+- output dir: `/home/ubuntu/PaddleOCR/output/rec/hdrc_svtrv2_rot90_ms_w1024_gpu1`
+- launch check: PID `1753512`, GPU1 active, `train.log` created.
+
+## Latest Update 2026-06-06 CHDAC Low-Backbone-LR Postprocess
+
+Completed clean evaluation, validation decode-bias sweep, and test-bias evaluation for:
+
+- Run: `logs/chdac_qbudgetpre_headlong_full_lowbb_0605`
+- Checkpoint: `logs/chdac_qbudgetpre_headlong_full_lowbb_0605/checkpoint_best_regular.pth`
+- Validation sweep: `logs/chdac_qbudgetpre_headlong_full_lowbb_0605/decode_bias_sweep_valid_0606.json`
+- Test result: `logs/chdac_qbudgetpre_headlong_full_lowbb_0605/micro_test_bias_b-20_nb00_0606.json`
+
+Selected validation setting:
+
+- Bias: `blank=-2.0`, `nonblank=0.0`
+- Valid CER/AR/CR: `42.92 / 57.08 / 58.96`
+- Valid empty pred: `5.76`
+- Valid Pred/GT length ratio: `0.849`
+
+Test metrics:
+
+- Samples: `4755`
+- CER micro: `33.13`
+- AR micro: `66.87`
+- CR micro: `68.73`
+- Empty pred: `4.12`
+- Pred/GT length ratio: `0.888`
+- Len=1/2/3-5/6-10/11+ CER: `46.74 / 34.63 / 29.34 / 28.74 / 33.94`
+
+Comparison:
+
+- Previous CHDAC bias test: CER `44.22`, AR `55.78`, CR `60.50`, Pred/GT `0.836`.
+- Low-backbone-LR CHDAC bias test: CER `33.13`, AR `66.87`, CR `68.73`, Pred/GT `0.888`.
+- This improves CHDAC substantially but remains much weaker than MTHv2/HDRC main results.
+
+Updated:
+
+- `logs/paper_results_summary.md`
+- `logs/paper_results_summary.csv`
+
+## Latest Update 2026-06-06 Gate C No-Localization Postprocess
+
+Started postprocess for the completed MTHv2 no-localization CTC control.
+
+- tmux session: `mthv2_noloc_postprocess_0606`
+- GPU: physical GPU0 only (`CUDA_VISIBLE_DEVICES=0`)
+- Run dir: `logs/mthv2_no_structure_ctc_full_0605`
+- Checkpoint: `logs/mthv2_no_structure_ctc_full_0605/checkpoint_best_regular.pth`
+- Planned outputs:
+  - `micro_valid_clean_0606.json`
+  - `micro_test_clean_0606.json`
+  - `decode_bias_sweep_valid_0606.json`
+
+Current observation:
+
+- Training finished through epoch 11.
+- Training-time validation remained blank-collapse dominated after epoch 1.
+- The clean valid postprocess is currently running; early processed samples report CER `1.0`, AR `0.0`, CR `0.0`.
+- Do not enter Gate C into the paper table until clean valid/test and validation sweep are complete. If the final result stays collapsed, report it as a conservative no-localization lower-bound control, not as a pure causal estimate of character-box localization supervision.
+
+Added analysis note:
+
+- `experiments/notes/ccfb_gap_and_model_modification_plan_0606.md`
+
+## Latest Update 2026-06-07 HDRC Head-Only vs Full Finetuning Evaluation
+
+Completed final-protocol evaluation for the HDRC head reconstruction checkpoint:
+
+- Run: `logs/mth1000mth1200pre_hdrcft_head_0527-1530`
+- Checkpoint: `logs/mth1000mth1200pre_hdrcft_head_0527-1530/checkpoint_best_regular.pth`
+- Clean valid/test:
+  - `logs/mth1000mth1200pre_hdrcft_head_0527-1530/micro_valid_clean_0607.json`
+  - `logs/mth1000mth1200pre_hdrcft_head_0527-1530/micro_test_clean_0607.json`
+- Validation sweep:
+  - `logs/mth1000mth1200pre_hdrcft_head_0527-1530/decode_bias_sweep_valid_0607.json`
+  - selected bias: `blank=-2.0`, `nonblank=0.4`
+- Test bias:
+  - `logs/mth1000mth1200pre_hdrcft_head_0527-1530/micro_test_bias_b-20_nb04_0607.json`
+
+Metrics:
+
+- Head-only clean test AR/CR: `82.28 / 82.68`
+- Head-only bias test AR/CR: `85.97 / 89.72`
+- Full-finetuning reference clean test AR/CR: `89.99 / 90.33`
+- Full-finetuning reference bias test AR/CR: `90.70 / 91.80`
+
+Interpretation:
+
+- The HDRC head-only checkpoint is usable but clearly weaker than full finetuning under the same validation-selected bias setting.
+- This closes a training-stage ablation for HDRC and supports retaining full finetuning in the SAQT pipeline.
+- Keep the claim scoped to HDRC unless MTHv2 head-only is also evaluated under the final AR/CR protocol.
+
+Updated:
+
+- `logs/paper_results_summary.md`
+- `logs/paper_results_summary.csv`
+- `docs/paper-drafts/05_results_analysis.md`
+- `docs/paper-drafts/latex/sections/05_results.tex`
+- `docs/paper-drafts/97_experiment_evidence_inventory.md`
+- `docs/paper-drafts/99_icdar_ccfb_readiness_audit.md`
+- `experiments/notes/ccfb_gap_and_model_modification_plan_0606.md`
+
+## Latest Update 2026-06-07 MTHv2 No-Localization Gate C Completed
+
+Completed validation decode-bias sweep and fixed-bias test evaluation for the MTHv2 no-localization CTC control:
+
+- Run: `logs/mthv2_no_structure_ctc_full_0605`
+- Checkpoint: `logs/mthv2_no_structure_ctc_full_0605/checkpoint_best_regular.pth`
+- Validation sweep: `logs/mthv2_no_structure_ctc_full_0605/decode_bias_sweep_valid_0606.json`
+- Selected validation bias: `blank=-2.0`, `nonblank=0.4`
+- Test bias result: `logs/mthv2_no_structure_ctc_full_0605/micro_test_bias_b-20_nb04_0606.json`
+
+Validation-selected bias metrics:
+
+- Valid CER/AR/CR micro: `99.8631 / 0.1369 / 0.3654`
+- Valid empty pred: `97.4973`
+- Valid Pred/GT length ratio: `0.0149`
+
+Test metrics:
+
+- Clean test CER/AR/CR micro: `99.9981 / 0.0019 / 0.0019`
+- Bias test CER/AR/CR micro: `99.8859 / 0.1141 / 0.1562`
+- Bias empty pred: `98.7757`
+- Bias Pred/GT length ratio: `0.0055`
+
+Interpretation:
+
+- Gate C is now complete for MTHv2 as a conservative no-localization lower-bound control.
+- The no-localization CTC control remains blank-collapsed even after validation-selected blank/nonblank calibration.
+- Paper wording should say this supports the practical need for character-localization query learning under the current training budget, not that the full gap is a pure causal estimate of character-box supervision.
+
+Updated:
+
+- `logs/paper_results_summary.md`
+- `logs/paper_results_summary.csv`
+- `docs/paper-drafts/05_results_analysis.md`
+- `docs/paper-drafts/latex/sections/05_results.tex`
+- `docs/paper-drafts/92_structure_learning_ablation_plan.md`
+- `docs/paper-drafts/94_submission_gate_checklist.md`
+- `docs/paper-drafts/97_experiment_evidence_inventory.md`
+- `docs/paper-drafts/99_icdar_ccfb_readiness_audit.md`
+- `experiments/notes/ccfb_gap_and_model_modification_plan_0606.md`
+
+## Latest Update 2026-06-06 MTHv2 No-Localization Clean Postprocess
+
+Completed clean validation/test postprocess for the MTHv2 no-localization CTC control:
+
+- Run: `logs/mthv2_no_structure_ctc_full_0605`
+- Checkpoint: `logs/mthv2_no_structure_ctc_full_0605/checkpoint_best_regular.pth`
+- Clean valid: `logs/mthv2_no_structure_ctc_full_0605/micro_valid_clean_0606.json`
+- Clean test: `logs/mthv2_no_structure_ctc_full_0605/micro_test_clean_0606.json`
+
+Clean validation metrics:
+
+- Samples: `10948`
+- CER/AR/CR micro: `99.9943 / 0.0057 / 0.0057`
+- Empty pred: `99.9635`
+- Pred/GT length ratio: `0.000057`
+
+Clean test metrics:
+
+- Samples: `10455`
+- CER/AR/CR micro: `99.9981 / 0.0019 / 0.0019`
+- Empty pred: `99.9713`
+- Pred/GT length ratio: `0.000028`
+
+Interpretation:
+
+- The matched no-localization control remains blank-collapsed after full training and clean postprocess.
+- Treat this as a conservative lower-bound control showing that, under the current training budget and same architecture family, line-level CTC alone does not form a usable query-to-sequence representation.
+- Do not write the full gap to SAQT as the pure causal effect of character boxes.
+
+Superseded status:
+
+- The validation decode-bias sweep was still running at this clean-postprocess checkpoint.
+- It completed in the later `2026-06-07 MTHv2 No-Localization Gate C Completed` update above.
+
+## Latest Update 2026-06-05 CHDAC Low-Backbone-LR Full Finetune Launch
+
+Launched a short CHDAC full finetune from the longer classifier-head reconstruction checkpoint to test whether conservative two-LR finetuning avoids the previous blank-heavy collapse.
+
+- tmux session: `chdac_full_lowbb_0605`
+- Output dir: `logs/chdac_qbudgetpre_headlong_full_lowbb_0605`
+- Source checkpoint: `logs/chdac_qbudgetpre_head_long_0604_src6727/checkpoint_best_regular.pth`
+- Key options: `lr=5e-6`, `lr_backbone=1e-6`, `epochs=6`, `batch_size=2`, `max_iterations=10000`
+- Decision target: beat previous CHDAC full valid CER `43.81`; stop/ignore if validation blank ratio rises again or CER stays far above the previous full best.
+
+## Latest Update 2026-06-05 HDRC Charset Adaptation Ablation
+
+Started the HDRC random-classifier-head control needed for the charset adaptation ablation.
+
+Debugging summary:
+
+- Direct `--device cuda:1` runs failed with an MSDA CUDA illegal memory access, both with and without smart charset mapping, so the failure was not specific to random-head initialization.
+- A one-step debug run using physical GPU1 exposed as logical `cuda:0` completed training and full validation:
+  - log dir: `logs/hdrc_charset_random_head_visible1_debug_0605`
+  - key result: epoch 0 completed after `max_optimizer_steps=1`; no illegal memory access was observed.
+- Based on that debug result, the official random-head head reconstruction run was launched in tmux with `CUDA_VISIBLE_DEVICES=1 --device cuda:0`.
+
+Official run:
+
+- tmux session: `hdrc_charset_random_head_visible1_0605`
+- log dir: `logs/hdrc_charset_random_head_visible1_0605`
+- source checkpoint: `logs/mth1000_mth1200_stage1_0512-1755/checkpoint.pth`
+- charset source: `data/tkhmth2200_mth1000_mth1200_charset.pkl`
+- protocol: no `--smart_mapping`, `--new_class_embedding`, HDRC data through `config/MTH1000_dtlr.py`
+- status at launch check: epoch 0 training started; GPU1 active; no MSDA crash observed.
+
+Next:
+
+- Let `logs/hdrc_charset_random_head_visible1_0605` finish head reconstruction.
+- If `checkpoint_best_regular.pth` is produced, launch the matched full finetuning run without `--smart_mapping`.
+- Only after clean/bias test AR/CR are generated should this ablation enter `docs/paper-drafts/05_results_analysis.md`.
 
 Next:
 
@@ -6312,3 +6880,502 @@ Updated:
 - `logs/paper_results_summary.md`
 - `logs/paper_results_summary.csv`
 - `experiments/notes/mthv2_qbudget_full_0603_analysis.md`
+## Latest Update 2026-06-07 MTHv2 Head-Only AR/CR Postprocess Launch
+
+Launched a GPU0-only tmux postprocess for the MTHv2 qbudget head-only checkpoint to close the optional MTHv2 head reconstruction vs full finetuning comparison under the same final AR/CR protocol.
+
+- tmux session: `mthv2_headonly_eval_0607`
+- script: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/run_headonly_eval_0607.sh`
+- checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- expected outputs:
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/micro_valid_clean_0607.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/micro_test_clean_0607.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/decode_bias_sweep_valid_0607.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/micro_test_bias_*_0607.json`
+- status at launch check: session exists, GPU0 active; do not cite results until all JSON outputs exist.
+
+## Latest Update 2026-06-07 HDRC QBudget-Localization Head Complete and Full Launch
+
+Completed the HDRC qbudget-localization-query head reconstruction run and launched the matched full finetuning run on physical GPU0 only.
+
+- completed head run: `logs/hdrc_qbudget_head_0607`
+- best validation CER from `log.txt`: `19.34` at epoch 2
+- comparison reference: HDRC head-only clean valid CER `20.56` from `logs/mth1000mth1200pre_hdrcft_head_0527-1530/micro_valid_clean_0607.json`
+- decision: head result is useful enough to continue full finetuning
+- launched tmux session: `hdrc_qbudget_full_0607`
+- full output dir: `logs/hdrc_qbudget_full_0607`
+- full source checkpoint: `logs/hdrc_qbudget_head_0607/checkpoint_best_regular.pth`
+- launch check: GPU0 active, GPU1 untouched by this run
+
+Next:
+
+- Monitor `logs/hdrc_qbudget_full_0607/log.txt` for validation CER.
+- After training completes, run clean valid/test, validation bias sweep, and fixed-bias test postprocess before adding any final AR/CR to the paper table.
+
+## Latest Update 2026-06-07 HDRC QBudget-Localization Full Epoch 1 Validation
+
+`logs/hdrc_qbudget_full_0607` produced a useful epoch 1 validation result while running on physical GPU0.
+
+- epoch 0 clean valid CER: `14.36`
+- epoch 1 clean valid CER: `9.60`
+- comparison reference: existing HDRC main clean valid CER `13.44` from `logs/mth1000mth1200pre_hdrcft_full_0527-1732/ctc_error_summary_valid_clean_0527.json`
+- decision: continue the run; this is promising validation evidence but not final paper evidence until clean test, validation bias sweep, and fixed-bias test AR/CR are generated
+- latest observed status: entered epoch 2; no postprocess launched yet
+
+Prepared postprocess script:
+
+- `logs/hdrc_qbudget_full_0607/run_postprocess_after_finish_0607.sh`
+- static check: `bash -n` passed
+- behavior: exits if `finetuning.py` for `logs/hdrc_qbudget_full_0607` is still running or if `log.txt` has not reached epoch 11; otherwise runs clean valid, clean test, validation bias sweep, selects rank-0 validation bias, and runs fixed-bias test on GPU0
+- launch only after the full run finishes:
+
+```bash
+tmux new-session -d -s hdrc_qbudget_full_postprocess_0607 'cd /home/ubuntu/DTLR && bash logs/hdrc_qbudget_full_0607/run_postprocess_after_finish_0607.sh'
+```
+
+## Latest Update 2026-06-07 HDRC QBudget-Localization Full Still Running
+
+Checked `logs/hdrc_qbudget_full_0607` at `2026-06-07 04:00 +0800`.
+
+- latest `log.txt` still contains validation rows only through epoch 1
+- latest `info.txt` shows epoch 2 training around step `2090/12142`
+- GPU0 is fully occupied by this run, so no clean/test postprocess or LGQ smoke should be launched yet
+- next action remains unchanged: wait for full training to finish, then launch `hdrc_qbudget_full_postprocess_0607` on GPU0
+
+## Latest Update 2026-06-07 MTHv2 Short GT-Presence Probe
+
+Finished a same-path 300-step continuation control for the DCTC-inspired short GT-presence probe.
+
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- base 300-step run: `logs/mthv2_base_resume_300_0607`, valid CER `12.5293`
+- short GT-presence 300-step run: `logs/mthv2_short_gt_presence_resume_0607`, valid CER `12.1378`
+- same evaluator/path comparison shows a small positive signal for short GT-presence, but the margin is not yet enough to treat as paper-ready
+- prepared sequential GPU0-only 1000-step probe script: `logs/mthv2_presence_probe_0607/run_16000_pair.sh`
+- launched tmux session: `dtlr_mthv2_presence_16000_0607`
+- sequential outputs:
+  - `logs/mthv2_base_resume_1000_0607`
+  - `logs/mthv2_short_gt_presence_resume_1000_0607`
+- status at launch check: base branch entered epoch 3 training on GPU0; GPU1 remains unused
+- base 1000-step branch completed with valid CER `11.8792`
+- short GT-presence 1000-step branch has started; wait for its same-path valid CER before deciding whether to continue the module
+- short GT-presence 1000-step branch completed with valid CER `12.0037`, worse than the same-path base `11.8792`; stop expanding this module for now
+- added short GT CE probe config and script:
+  - `config/MTHV2_dtlr_short_gt_ce.py`
+  - `logs/mthv2_short_gt_ce_probe_0607/run_16000.sh`
+- launched tmux session: `dtlr_mthv2_short_gt_ce_16000_0607`
+- output dir: `logs/mthv2_short_gt_ce_resume_1000_0607`
+- status at launch check: training started on GPU0; GPU1 remains unused
+- short GT CE 1000-step branch completed with valid CER `11.6480`, better than same-path base `11.8792`
+- decision: short GT CE has a positive signal; run one conservative coefficient probe (`short_gt_ce_loss_coef=0.005`) before deciding whether to expand
+- launched tmux session: `dtlr_mthv2_short_gt_ce005_16000_0607`
+- output dir: `logs/mthv2_short_gt_ce005_resume_1000_0607`
+- short GT CE 0.005 1000-step branch completed with valid CER `12.1983`, worse than same-path base `11.8792` and 0.01 branch `11.6480`
+- decision: keep `short_gt_ce_loss_coef=0.01` as the current promising candidate; do not expand the 0.005 branch
+- prepared 2000-step stability probe script: `logs/mthv2_short_gt_ce_probe_0607/run_17000_pair.sh`
+- launched tmux session: `dtlr_mthv2_short_gt_ce_17000_pair_0607`
+- sequential outputs:
+  - `logs/mthv2_base_resume_2000_0607`
+  - `logs/mthv2_short_gt_ce_resume_2000_0607`
+- base 2000-step branch completed with valid CER `12.0155`; short GT CE 2000-step branch has started
+- short GT CE 2000-step branch completed with valid CER `12.0367`, slightly worse than same-path base `12.0155`
+- decision: short GT CE 0.01 showed a 1000-step positive signal but did not hold at 2000 steps; treat it as unstable and do not make it paper-facing yet
+- added conservative CTC expected-count probe:
+  - config: `config/MTHV2_dtlr_ctc_count.py`
+  - script: `logs/mthv2_short_gt_ce_probe_0607/run_16000_ctc_count.sh`
+  - tmux session: `dtlr_mthv2_ctc_count_16000_0607`
+  - output dir: `logs/mthv2_ctc_count_resume_1000_0607`
+- CTC expected-count 1000-step branch completed with valid CER `11.5352`, better than same-path base `11.8792`
+- decision: this is the strongest quick-probe signal so far; run a 2000-step stability check against the existing base 2000-step result `12.0155`
+- prepared CTC expected-count 2000-step stability script: `logs/mthv2_short_gt_ce_probe_0607/run_17000_ctc_count.sh`
+- launched tmux session: `dtlr_mthv2_ctc_count_17000_0607`
+- output dir: `logs/mthv2_ctc_count_resume_2000_0607`
+- CTC expected-count 0.02 2000-step branch completed with valid CER `12.3993`, worse than same-path base `12.0155`
+- decision: coefficient `0.02` has a strong 1000-step signal but is unstable by 2000 steps; do not treat it as confirmed useful
+- prepared lower-weight CTC expected-count 2000-step script: `logs/mthv2_short_gt_ce_probe_0607/run_17000_ctc_count_coef001.sh`
+- launched tmux session: `dtlr_mthv2_ctc_count001_17000_0607`
+- output dir: `logs/mthv2_ctc_count001_resume_2000_0607`
+- CTC expected-count 0.01 2000-step branch completed with valid CER `11.4864`, better than same-path base `12.0155`
+- decision: `ctc_count_loss_coef=0.01` is the strongest current module candidate, but it is still only a quick same-path validation probe and is not paper-ready without clean/bias AR/CR and length-bucket postprocess
+- next stability check: run a matched 5000-step continuation pair from the same source checkpoint to `max_optimizer_steps=20000`
+- prepared and launched GPU0-only tmux session `dtlr_mthv2_ctc_count001_20000_pair_0607`
+- script: `logs/mthv2_short_gt_ce_probe_0607/run_20000_ctc_count001_pair.sh`
+- sequential outputs:
+  - `logs/mthv2_base_resume_5000_0607`
+  - `logs/mthv2_ctc_count001_resume_5000_0607`
+- launch check: GPU0 active and base output directory created; wait for both branches before drawing a conclusion
+- base 5000-step branch completed with valid CER `11.3099`
+- `ctc_count_loss_coef=0.01` 5000-step branch started automatically; wait for its valid CER before deciding whether the module remains positive
+- CTC expected-count 0.01 5000-step branch completed with valid CER `11.1178`
+- matched comparison at `max_optimizer_steps=20000`: base `11.3099` vs count-loss `11.1178`
+- decision: the 0.01 expected-count auxiliary loss remains positive after a longer same-path continuation, but the gain is smaller than at 2000 steps; stop blind module search and treat this as the main candidate for a formal full-finetuning ablation rather than a paper-ready result
+
+## Latest Update 2026-06-08 MTHv2 CTC Expected-Count Full Ablation Launch
+
+Launched a formal full-finetuning ablation for the conservative CTC expected-count auxiliary loss.
+
+- config: `config/MTHV2_dtlr_ctc_count001.py`
+- launch script: `logs/mthv2_short_gt_ce_probe_0607/run_full_ctc_count001_0608.sh`
+- tmux session: `dtlr_mthv2_full_ctc_count001_0608`
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- matched baseline: `logs/mthv2_qbudgetstage1pre_mthv2_full_0603`
+- key change: `ctc_count_loss_coef=0.01`, `ctc_count_loss_short_weight=3.0`
+- launch check: checkpoint keys matched, epoch 0 training started on GPU0, `loss_ctc_count` appears in `info.txt`
+
+Next:
+
+- Monitor validation CER against the matched baseline trajectory, especially epochs 2-7.
+- Do not treat it as paper-ready unless the best checkpoint also passes clean/bias AR/CR postprocess and length-bucket analysis.
+
+## Latest Update 2026-06-08 MTHv2 CTC Expected-Count Full Ablation Epoch 0
+
+The formal full-finetuning ablation completed epoch 0 validation and continued into epoch 1.
+
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608`
+- epoch 0 valid CER: `0.1175580301067021`
+- matched baseline epoch 0 valid CER: `0.11822557932137827`
+- checkpoint: `checkpoint_best_regular.pth` saved at epoch 0
+- status: slightly better than matched baseline at epoch 0, but the margin is small; continue monitoring through the baseline's strong epoch range, especially epochs 2-7
+
+## Latest Update 2026-06-08 MTHv2 CTC Expected-Count Full Ablation Epoch 1
+
+The ablation completed epoch 1 validation and continued into epoch 2.
+
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608`
+- epoch 1 valid CER: `0.1075320673763477`
+- matched baseline epoch 1 valid CER: `0.12044717928196699`
+- checkpoint: `checkpoint_best_regular.pth` refreshed at epoch 1
+- status: positive early signal; epoch 1 is much better than the matched baseline epoch 1 and close to the baseline's later strong range, but continue through epochs 2-7 before making a formal ablation conclusion
+
+## Latest Update 2026-06-08 MTHv2 CTC Expected-Count Full Ablation Finished
+
+The formal full-finetuning ablation completed all 12 epochs.
+
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608`
+- best valid CER: `0.09644768863616773` at epoch 9
+- matched baseline best valid CER: `0.10127716468336462` at epoch 7
+- final epoch valid CER: `0.09777347360672171`
+- checkpoint: `checkpoint_best_regular.pth`
+- status: useful validation result; proceed to clean valid/test, validation-selected decode-bias sweep, fixed-bias test, and length-bucket/empty/pred-length analysis before adding it to paper result tables
+- postprocess script: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/run_postprocess_0608.sh`
+
+## Latest Update 2026-06-08 MTHv2 CTC Expected-Count Full Ablation Postprocess
+
+Completed clean valid/test, validation bias sweep, and fixed-bias test for the full expected-count ablation.
+
+- run dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608`
+- clean valid: CER `4.22`, AR `95.78`, CR `95.95`, empty `2.54`, Pred/GT `0.982`
+- clean test: CER `3.67`, AR `96.33`, CR `96.50`, empty `2.83`, Pred/GT `0.984`
+- validation-selected bias: `blank=-2.0`, `nonblank=0.8`
+- bias valid: CER `3.72`, AR `96.28`, CR `96.54`, empty `0.62`, Pred/GT `0.997`
+- bias test: CER `3.25`, AR `96.75`, CR `97.00`, empty `0.77`, Pred/GT `0.998`
+- matched original qbudget bias test: CER `3.31`, AR `96.69`, CR `96.90`, empty `0.89`, Pred/GT `0.997`
+- result files:
+  - `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/micro_valid_clean_0608.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/micro_test_clean_0608.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/decode_bias_sweep_valid_0608.json`
+  - `logs/mthv2_qbudgetstage1pre_mthv2_full_ctc_count001_0608/micro_test_bias_b-20_nb08_0608.json`
+- paper summary updated:
+  - `logs/paper_results_summary.md`
+  - `logs/paper_results_summary.csv`
+- decision: expected-count auxiliary loss is now a paper-facing MTHv2 module candidate with a modest but consistent gain; next useful step is to verify whether it transfers to HDRC or keep it as an MTHv2-only ablation if GPU time is limited
+
+## Latest Update 2026-06-08 MTHv2 SQR Probe Launch
+
+Launched a short sorted-query sequence refinement probe to test an actual
+architecture change rather than another decode/loss-only tweak.
+
+- code: `models/dino/dino.py`
+- config: `config/MTHV2_dtlr_sqr_probe.py`
+- test: `tests/test_query_sequence_refiner.py`
+- tmux session: `dtlr_mthv2_sqr_probe_0608`
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_sqr_probe_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- old charset: `logs/mthv2_stage1_qbudget_from_mth1000mth1200_gpu0_0602/charset.pkl`
+- budget: `max_optimizer_steps=1000`, `epochs=1`, GPU0 only
+- launch check: SQR parameters are present in the model; checkpoint load reports only the new SQR weights as missing keys, which is expected
+- status: validation is running; do not draw a conclusion until the epoch-0 valid CER is written to `log.txt`
+
+## Latest Update 2026-06-08 MTHv2 SQR Probe Result
+
+The short SQR architecture probe finished and is negative under the matched
+short-budget screening protocol.
+
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_sqr_probe_0608`
+- budget: `max_optimizer_steps=1000`
+- SQR valid CER: `0.14652383846549272`
+- same-path base 1000-step valid CER: `0.11879202286282202` from `logs/mthv2_base_resume_1000_0607`
+- checkpoint: `checkpoint_best_regular.pth` exists, but should not be promoted
+- decision: do not expand SQR to 5k/full ablation; it is a useful negative result showing that naive post-decoder query sequence refinement hurts the qbudget recognition path
+
+## Latest Update 2026-06-08 MTHv2 Sorted CTC Refiner Probe Launch
+
+Launched a corrected sorted CTC-only refiner probe. This differs from the
+negative SQR run because the refiner is applied after sorting decoder query
+features by predicted vertical coordinate and only supplies CTC logits; the
+detection/classification output used for query localization remains unchanged.
+
+- code: `models/dino/dino.py`
+- config: `config/MTHV2_dtlr_sorted_ctc_refiner_probe.py`
+- test: `tests/test_query_sequence_refiner.py`
+- tmux session: `dtlr_mthv2_sortedctc_refiner_1000_0608`
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_sortedctc_refiner_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- old charset: `logs/mthv2_stage1_qbudget_from_mth1000mth1200_gpu0_0602/charset.pkl`
+- budget: `max_optimizer_steps=1000`, `epochs=1`, GPU0 only
+- launch check: `sorted_ctc_refiner` parameters are present; checkpoint load reports only the new refiner weights as missing keys
+- comparison target: same-path base 1000-step valid CER `0.11879202286282202`
+
+## Latest Update 2026-06-08 MTHv2 Sorted CTC Refiner Probe Result
+
+The corrected sorted CTC-only refiner is still negative under the matched
+short-budget screening protocol.
+
+- output dir: `logs/mthv2_qbudgetstage1pre_mthv2_full_sortedctc_refiner_1000_0608`
+- budget: `max_optimizer_steps=1000`, `epochs=1`, GPU0 only
+- sorted CTC refiner valid CER: `0.14268892258667745`
+- same-path base 1000-step valid CER: `0.11879202286282202` from `logs/mthv2_base_resume_1000_0607`
+- observed valid blank prediction ratio: `0.989708535038384`
+- checkpoint: `checkpoint_best_regular.pth` exists, but should not be promoted
+- decision: stop this branch; sorting queries before a small sequence refiner does not recover the loss from adding fresh recurrent/transformer sequence parameters on top of the qbudget recognition path
+
+## Latest Update 2026-06-08 MTHv2 DCTC-Lite Probe Launch
+
+Added and launched a DCTC-inspired Viterbi alignment regularization probe.
+This module adds a train-time best-path alignment loss on the sorted query CTC
+probabilities and does not add inference parameters.
+
+- code: `models/dino/dino.py`
+- config: `config/MTHV2_dtlr_dctc_lite.py`
+- test: `tests/test_ctc_viterbi_alignment_loss.py`
+- verification: `python -m unittest tests.test_ctc_viterbi_alignment_loss tests.test_query_sequence_refiner tests.test_query_activation_module tests.test_glyph_prototype_branch` passed, `py_compile` passed
+- stopped initial padded-path run: `logs/mthv2_dctc_lite_resume_1000_0608`; the auxiliary loss was nearly zero because it was dominated by artificial inserted blank frames
+- active tmux session: `dtlr_mthv2_dctc_lite_unpadded_16000_0608`
+- active output dir: `logs/mthv2_dctc_lite_unpadded_resume_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- budget: `max_optimizer_steps=16000`, matched to `logs/mthv2_base_resume_1000_0607`, GPU0 only
+- launch check: training started and `loss_ctc_viterbi_unscaled` is nonzero but small (`0.0234` at step 0, `0.0091` running average at step 10)
+- comparison target: same-path base valid CER `0.11879202286282202`
+- decision rule: if final valid CER is not clearly better than the base, stop this DCTC-lite branch because the DP overhead is too high for a weak signal
+
+## Latest Update 2026-06-08 MTHv2 DCTC-Lite Probe Result
+
+The DCTC-inspired Viterbi alignment branch is negative under the matched
+short-budget screening protocol.
+
+- final tested config: `config/MTHV2_dtlr_dctc_lite.py`
+- final output dir: `logs/mthv2_dctc_lite_short2_resume_1000_0608`
+- final variant: short samples only, `ctc_viterbi_loss_max_len=2`, blank-path weight `0.0`, nonblank-path weight `1.0`, coefficient `0.02`
+- final valid CER: `0.12021899929869666`
+- same-path base valid CER: `0.11879202286282202` from `logs/mthv2_base_resume_1000_0607`
+- selected valid sample ratio: `0.26918158567774936`
+- stopped exploratory variants:
+  - `logs/mthv2_dctc_lite_resume_1000_0608`: padded CTC path, auxiliary loss nearly zero because artificial blank frames dominated
+  - `logs/mthv2_dctc_lite_unpadded_resume_1000_0608`: unpadded all-length path, still weak and slow
+  - `logs/mthv2_dctc_lite_charpath_resume_1000_0608`: all-length nonblank path, meaningful loss but too slow for routine probes
+- decision: stop DCTC-lite; the only module with stable positive evidence remains the conservative CTC expected-count auxiliary loss on MTHv2
+
+## Latest Update 2026-06-08 MTHv2 Glyph Prototype Auxiliary Probe Result
+
+The glyph prototype branch was converted from direct prototype-logit fusion
+into a train-time auxiliary loss on query features. Under the matched
+1000-step screening protocol, it gives a clear positive validation signal and
+is worth one stability probe before any paper-level promotion.
+
+- code: `models/dino/dino.py`
+- config: `config/MTHV2_dtlr_proto_aux.py`
+- output dir: `logs/mthv2_proto_aux_resume_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- budget: source `global_step=15000` to `max_optimizer_steps=16000`, GPU0 only
+- valid CER: `0.11254894938234107`
+- same-path base 1000-step valid CER: `0.11879202286282202` from `logs/mthv2_base_resume_1000_0607`
+- observed valid blank prediction ratio: `0.9894744982282132`
+- auxiliary loss behavior: `loss_glyph_proto_aux_unscaled` remains high (`8.7269` on valid), so this should be treated as a regularizing signal rather than a learned standalone classifier
+- decision: run a 2000-step stability probe before deciding whether this branch deserves full MTHv2/HDRC testing
+
+## Latest Update 2026-06-08 MTHv2 Glyph Prototype Auxiliary Stability Probe Launch
+
+Launched a 2000-step stability probe for the positive glyph prototype
+auxiliary branch.
+
+- tmux session: `dtlr_mthv2_proto_aux_17000_0608`
+- output dir: `logs/mthv2_proto_aux_resume_2000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- config: `config/MTHV2_dtlr_proto_aux.py`
+- budget: source `global_step=15000` to `max_optimizer_steps=17000`, GPU0 only
+- launch check: training started, GPU0 active, GPU1 idle, `loss_glyph_proto_aux` is present
+- comparison targets:
+  - same-path base 1000-step valid CER: `0.11879202286282202`
+  - proto-aux 1000-step valid CER: `0.11254894938234107`
+- decision rule: if the 2000-step valid CER is still better than the matched base and not worse than the 1000-step result by more than normal noise, promote to a longer MTHv2 run; otherwise treat the 1000-step gain as unstable
+
+## Latest Update 2026-06-08 MTHv2 Glyph Prototype Auxiliary Stability Probe Result
+
+The 2000-step stability probe remains better than the matched base but
+regresses from the 1000-step result, so the prototype auxiliary branch is
+weakly useful rather than ready for direct full-run promotion.
+
+- output dir: `logs/mthv2_proto_aux_resume_2000_0608`
+- budget: source `global_step=15000` to `max_optimizer_steps=17000`, GPU0 only
+- valid CER: `0.11686458066384413`
+- same-path base 1000-step valid CER: `0.11879202286282202`
+- proto-aux 1000-step valid CER: `0.11254894938234107`
+- observed valid blank prediction ratio: `0.9895206761482122`
+- decision: do not promote prototype-aux alone to full MTHv2/HDRC yet; test whether it combines constructively with the already positive CTC expected-count loss
+
+## Latest Update 2026-06-08 MTHv2 Count + Prototype Auxiliary Probe Launch
+
+Added and launched a conservative combination probe using the two currently
+most plausible auxiliary signals: CTC expected-count regularization and
+glyph-prototype auxiliary supervision.
+
+- config: `config/MTHV2_dtlr_ctc_count_proto_aux.py`
+- tmux session: `dtlr_mthv2_count_proto_aux_16000_0608`
+- output dir: `logs/mthv2_count_proto_aux_resume_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- budget: source `global_step=15000` to `max_optimizer_steps=16000`, GPU0 only
+- launch check: `loss_ctc_count` and `loss_glyph_proto_aux` are both present; GPU0 active, GPU1 idle
+- comparison targets:
+  - same-path base 1000-step valid CER: `0.11879202286282202`
+  - proto-aux 1000-step valid CER: `0.11254894938234107`
+  - proto-aux 2000-step valid CER: `0.11686458066384413`
+- decision rule: keep only if the combination is at least competitive with proto-aux 1000-step or clearly more stable than proto-aux alone
+
+## Latest Update 2026-06-08 MTHv2 Count + Prototype Auxiliary Probe Result
+
+The count + prototype auxiliary combination is negative under the matched
+1000-step screening protocol, so this combination should not be promoted to a
+longer run.
+
+- output dir: `logs/mthv2_count_proto_aux_resume_1000_0608`
+- config: `config/MTHV2_dtlr_ctc_count_proto_aux.py`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- budget: source `global_step=15000` to `max_optimizer_steps=16000`, GPU0 only
+- valid CER: `0.12123513930652727`
+- same-path base 1000-step valid CER: `0.11879202286282202`
+- proto-aux 1000-step valid CER: `0.11254894938234107`
+- proto-aux 2000-step valid CER: `0.11686458066384413`
+- observed valid blank prediction ratio: `0.9895459472490655`
+- decision: stop this combination; keep the expected-count branch as the more
+  reliable positive module, and treat prototype-aux as a weak isolated signal
+  unless later stability evidence improves
+
+## Latest Update 2026-06-08 MTHv2 CTC Blank-Cap Probe Result
+
+Tested a lightweight train/eval-time blank probability cap as an anti-collapse
+constraint. The result is negative under the matched 1000-step screening
+protocol.
+
+- config: `config/MTHV2_dtlr_blankcap.py`
+- output dir: `logs/mthv2_blankcap_resume_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- budget: source continuation to `max_optimizer_steps=16000`, GPU0 only
+- key setting: `ctc_blank_max=0.995`
+- valid CER: `0.122598022794169`
+- observed valid blank prediction ratio: `0.9895592424276758`
+- same-path base 1000-step valid CER: `0.11879202286282202`
+- decision: stop blank-cap tuning; it raises CTC loss and does not improve the
+  blank/nonblank behavior enough to justify further coefficient sweeps
+
+## Latest Update 2026-06-08 MTHv2 MSR-v2 Probe Result
+
+Tested a conservative multi-scale resize variant to check whether the observed
+MTHv2 gains could be explained by a simple resize policy. The result is
+negative under the matched 1000-step screening protocol.
+
+- config: `config/MTHV2_dtlr_msr_v2_probe.py`
+- output dir: `logs/mthv2_msr_v2_resume_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- budget: source continuation to `max_optimizer_steps=16000`, GPU0 only
+- key setting: `mth1000_use_msr=True`, with conservative train/eval buckets
+- valid CER: `0.13038121476002637`
+- observed valid blank prediction ratio: `0.9896400283952678`
+- same-path base 1000-step valid CER: `0.11879202286282202`
+- decision: stop MSR-v2; the lower validation loss does not translate to
+  better recognition, so the paper story should not attribute SAQT's gains to
+  simple multi-scale resizing
+
+## Latest Update 2026-06-08 MTHv2 Length-Balance Probe Aborted
+
+Tried to launch a conservative length-balanced sampling probe, but the run was
+not a valid test of the intended module because the current MTHCombo dataset
+does not expose the `samples` attribute expected by the sampler helper.
+
+- config: `config/MTHV2_dtlr_length_balance_probe.py`
+- output dir: `logs/mthv2_length_balance_resume_1000_0608`
+- source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+- observation: log reports `Length-balanced sampling requested, but dataset has no samples attribute. Falling back to RandomSampler.`
+- action: stopped the run at about epoch 3 step 430 using `kill -TERM`
+- decision: do not treat this as a length-balance result; a real MTHv2
+  length-balance experiment would first need sampler support for MTHCombo or a
+  different dataset wrapper
+
+## Latest Update 2026-06-08 MTHCombo Length-Balance Support
+
+Added minimal sampler support for MTHCombo by exposing a flattened `samples`
+list from its MTH1000-style child datasets. This preserves the existing
+`__getitem__` routing and charset behavior while allowing finetuning's
+length-balanced sampler to read GT text lengths.
+
+- code change: `datasets/MTHCombo.py`
+- verification:
+  - `python -m py_compile datasets/MTHCombo.py finetuning.py`
+  - direct MTHCombo construction produced `len(ds)=84176` and
+    `len(ds.samples)=84176`
+  - `python -m unittest tests.test_mth_combo_dataset` passed; the mock test
+    confirms flattened `samples` exposure while preserving child-dataset index
+    routing
+- intended follow-up run:
+  - config: `config/MTHV2_dtlr_length_balance_probe.py`
+  - output dir: `logs/mthv2_length_balance_v2_resume_1000_0608`
+  - launch script:
+    `logs/mthv2_length_balance_v2_resume_1000_0608/run_length_balance_probe_0608.sh`
+  - source checkpoint: `logs/mthv2_qbudgetstage1pre_mthv2_head_0603/checkpoint_best_regular.pth`
+  - budget: continuation to `max_optimizer_steps=16000`, GPU0 only
+- status: launch blocked because the required escalated tmux launch was
+  rejected by the execution environment; do not run this long probe in a
+  foreground Codex session
+
+## Latest Update 2026-06-08 MTHv2 Length-Balance Smoke Verification
+
+Verified that the MTHCombo sampler support is active with a foreground
+two-step smoke run. This is not a performance result; it only proves that the
+length-balanced sampler now receives GT text lengths for MTHv2-combo.
+
+- smoke output dir: `logs/mthv2_length_balance_smoke_0608`
+- command budget: `max_iterations=10`, `max_optimizer_steps=15002`,
+  `eval_epoch=99`
+- log evidence: `Using length-balanced WeightedRandomSampler`
+- raw train length counts:
+  - `1`: `9006`
+  - `2`: `7785`
+  - `3-5`: `10310`
+  - `6-10`: `8279`
+  - `11+`: `48796`
+- effective sampling distribution:
+  - `1`: `0.23467792370231394`
+  - `2`: `0.13524077548467792`
+  - `3-5`: `0.1343287471336252`
+  - `6-10`: `0.07191126398443472`
+  - `11+`: `0.4238412896949482`
+- decision: length-balanced MTHv2 is now technically ready for the real
+  matched 1000-step GPU0 probe, but the real probe still needs a tmux launch
+  because it is a long training/evaluation job
+
+## Latest Update 2026-06-08 MTHv2 Length-Balance Tmux Launch Blocked Again
+
+Rechecked GPU and process state before launching the real length-balanced
+probe. GPU0 and GPU1 were both idle, and no DTLR training process was running.
+The output directory still contained only the launch script, with no checkpoint
+or training log.
+
+- intended tmux session:
+  `dtlr_mthv2_length_balance_v2_16000_0608`
+- command attempted:
+  `tmux new-session -d -s dtlr_mthv2_length_balance_v2_16000_0608 -c /home/ubuntu/DTLR logs/mthv2_length_balance_v2_resume_1000_0608/run_length_balance_probe_0608.sh`
+- sandbox result:
+  `error connecting to /tmp/tmux-1000/default (Operation not permitted)`
+- escalated retry result: rejected by the execution environment
+- decision: do not run this long probe in a foreground Codex session and do not
+  use `nohup` or other workarounds. Length-balanced sampling remains
+  technically ready but experimentally unverified beyond the smoke test.

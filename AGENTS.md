@@ -1,6 +1,8 @@
-# DTLR Project Guide
+# SAQT Project Guide
 
-This repository is for DTLR-based vertical ancient text recognition experiments.
+This repository is for SAQT vertical ancient text recognition experiments. It
+retains some DTLR/DINO-compatible module, config, data, and log names for
+checkpoint reproducibility.
 
 ## Long-Term Project Rules
 
@@ -24,10 +26,13 @@ This repository is for DTLR-based vertical ancient text recognition experiments.
 
 ## Data And Config Conventions
 
-- Real vertical line finetuning config: `config/MTH1000_dtlr.py`
+- Paper-facing MTHv2 config: `config/SAQT_MTHV2.py`
+- Paper-facing HDRC config: `config/SAQT_HDRC.py`
+- Legacy vertical line finetuning config: `config/MTH1000_dtlr.py`
 - Best real stage-1 config: `config/MTH1000_MTH1200_stage1.py`
 - Ancient synthetic best-size config: `config/SynthVerticalAncient100k_stage1_bestcfg.py`
-- Processed line datasets usually live under `data/*_dtlr`
+- Processed line datasets usually live under `data/*_dtlr`; this suffix is a
+  compatibility data-format name, not the paper-facing method name.
 - Logs always live under `logs/`
 - Box diagnostics always live under `debug_vis/`
 

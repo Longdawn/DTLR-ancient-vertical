@@ -103,6 +103,53 @@ def fuse_glyph_prototype_logits(pred_logits, pred_proto_logits, glyph_proto_fuse
     return pred_logits + float(glyph_proto_fuse_coef) * pred_proto_logits
 
 
+class QuerySequenceRefiner(nn.Module):
+    def __init__(self, hidden_dim, num_layers=1, kernel_size=3, dropout=0.0):
+        super().__init__()
+        hidden_dim = int(hidden_dim)
+        num_layers = int(num_layers)
+        kernel_size = int(kernel_size)
+        if num_layers < 1:
+            raise ValueError("num_layers must be >= 1")
+        if kernel_size < 1 or kernel_size % 2 == 0:
+            raise ValueError("kernel_size must be a positive odd integer")
+
+        layers = []
+        for _ in range(num_layers):
+            layers.append(
+                nn.ModuleDict(
+                    {
+                        "norm": nn.LayerNorm(hidden_dim),
+                        "dwconv": nn.Conv1d(
+                            hidden_dim,
+                            hidden_dim,
+                            kernel_size=kernel_size,
+                            padding=kernel_size // 2,
+                            groups=hidden_dim,
+                        ),
+                        "ffn": nn.Sequential(
+                            nn.Linear(hidden_dim, hidden_dim * 2),
+                            nn.GELU(),
+                            nn.Dropout(float(dropout)),
+                            nn.Linear(hidden_dim * 2, hidden_dim),
+                            nn.Dropout(float(dropout)),
+                        ),
+                    }
+                )
+            )
+        self.layers = nn.ModuleList(layers)
+
+    def forward(self, query_feats):
+        refined = query_feats
+        for layer in self.layers:
+            residual = refined
+            x = layer["norm"](refined)
+            x = layer["dwconv"](x.transpose(1, 2)).transpose(1, 2)
+            x = layer["ffn"](x)
+            refined = residual + x
+        return refined
+
+
 def compute_short_query_ce_loss(char_probs, targets, max_len=0, gamma=0.0):
     ce_losses = []
     eligible_samples = 0
@@ -150,6 +197,168 @@ def compute_short_query_ce_loss(char_probs, targets, max_len=0, gamma=0.0):
     }
 
 
+def compute_glyph_proto_aux_loss(
+    pred_proto_logits,
+    char_probs,
+    targets,
+    max_len=0,
+    gamma=0.0,
+):
+    ce_losses = []
+    eligible_samples = 0
+    selected_chars = 0
+    device = pred_proto_logits.device
+
+    for batch_idx, target in enumerate(targets):
+        labels = target["labels"].long().to(device)
+        if labels.numel() == 0:
+            continue
+        if int(max_len) > 0 and labels.numel() > int(max_len):
+            continue
+
+        eligible_samples += 1
+        used_queries = torch.zeros(
+            pred_proto_logits.shape[1],
+            dtype=torch.bool,
+            device=device,
+        )
+        for label in labels:
+            if label.item() < 0 or label.item() >= pred_proto_logits.shape[-1]:
+                continue
+            scores = char_probs[batch_idx, :, label].detach().clone()
+            if used_queries.all():
+                used_queries.zero_()
+            scores[used_queries] = -1.0
+            query_idx = scores.argmax()
+            used_queries[query_idx] = True
+
+            proto_logits = pred_proto_logits[batch_idx, query_idx].unsqueeze(0)
+            label_tensor = label.view(1)
+            nll = F.cross_entropy(proto_logits, label_tensor, reduction="none").squeeze(0)
+            if float(gamma) > 0:
+                prob = proto_logits.softmax(-1)[0, label].detach()
+                nll = ((1.0 - prob) ** float(gamma)) * nll
+            ce_losses.append(nll)
+            selected_chars += 1
+
+    if ce_losses:
+        loss = torch.stack(ce_losses).mean()
+    else:
+        loss = pred_proto_logits.sum() * 0.0
+
+    return loss, {
+        "eligible_samples": eligible_samples,
+        "selected_chars": selected_chars,
+    }
+
+
+def _ctc_viterbi_path(log_probs, labels, blank=0):
+    labels = [int(label) for label in labels]
+    if len(labels) == 0:
+        return torch.full(
+            (log_probs.shape[0],),
+            int(blank),
+            dtype=torch.long,
+            device=log_probs.device,
+        )
+
+    extended = [int(blank)]
+    for label in labels:
+        extended.extend([label, int(blank)])
+    ext = torch.tensor(extended, dtype=torch.long, device=log_probs.device)
+
+    with torch.no_grad():
+        scores = log_probs.detach()
+        time_steps = scores.shape[0]
+        state_count = ext.numel()
+        neg_inf = torch.finfo(scores.dtype).min
+        dp = scores.new_full((time_steps, state_count), neg_inf)
+        backptr = torch.zeros(
+            (time_steps, state_count),
+            dtype=torch.long,
+            device=scores.device,
+        )
+
+        dp[0, 0] = scores[0, ext[0]]
+        if state_count > 1:
+            dp[0, 1] = scores[0, ext[1]]
+
+        for t in range(1, time_steps):
+            for s in range(state_count):
+                prev_states = [s]
+                if s - 1 >= 0:
+                    prev_states.append(s - 1)
+                if (
+                    s - 2 >= 0
+                    and int(ext[s].item()) != int(blank)
+                    and int(ext[s].item()) != int(ext[s - 2].item())
+                ):
+                    prev_states.append(s - 2)
+
+                prev = torch.stack([dp[t - 1, prev_s] for prev_s in prev_states])
+                best_offset = int(prev.argmax().item())
+                best_state = prev_states[best_offset]
+                dp[t, s] = prev[best_offset] + scores[t, ext[s]]
+                backptr[t, s] = best_state
+
+        if state_count == 1:
+            state = 0
+        else:
+            final_candidates = torch.stack([dp[-1, state_count - 1], dp[-1, state_count - 2]])
+            state = state_count - 1 if int(final_candidates.argmax().item()) == 0 else state_count - 2
+
+        path_states = []
+        for t in range(time_steps - 1, -1, -1):
+            path_states.append(state)
+            state = int(backptr[t, state].item())
+        path_states.reverse()
+        path_states = torch.tensor(path_states, dtype=torch.long, device=log_probs.device)
+        return ext[path_states]
+
+
+def compute_ctc_viterbi_alignment_loss(
+    log_probs,
+    targets_tensor,
+    target_lengths,
+    blank=0,
+    blank_weight=0.0,
+    nonblank_weight=1.0,
+    max_target_len=0,
+):
+    if log_probs.dim() != 3:
+        raise ValueError("log_probs must have shape [T, B, C]")
+
+    losses = []
+    selected_samples = 0
+    time_steps = log_probs.shape[0]
+    frame_index = torch.arange(time_steps, device=log_probs.device)
+
+    for batch_idx in range(log_probs.shape[1]):
+        target_len = int(target_lengths[batch_idx].item())
+        if target_len <= 0:
+            continue
+        if int(max_target_len) > 0 and target_len > int(max_target_len):
+            continue
+
+        labels = targets_tensor[batch_idx, :target_len].long().tolist()
+        path = _ctc_viterbi_path(log_probs[:, batch_idx, :], labels, blank=blank)
+        nll = -log_probs[:, batch_idx, :][frame_index, path]
+        weights = torch.full_like(nll, float(blank_weight))
+        weights[path != int(blank)] = float(nonblank_weight)
+        normalizer = weights.sum().clamp(min=1.0)
+        losses.append((nll * weights).sum() / normalizer)
+        selected_samples += 1
+
+    if losses:
+        loss = torch.stack(losses).mean()
+    else:
+        loss = log_probs.sum() * 0.0
+
+    return loss, {
+        "selected_samples": selected_samples,
+    }
+
+
 class DINO(nn.Module):
     """This is the Cross-Attention Detector module that performs object detection"""
 
@@ -186,6 +395,15 @@ class DINO(nn.Module):
         glyph_proto_dim=256,
         glyph_proto_temperature=1.0,
         glyph_proto_trainable=True,
+        use_query_sequence_refiner=False,
+        query_sequence_refiner_layers=1,
+        query_sequence_refiner_kernel=3,
+        query_sequence_refiner_dropout=0.0,
+        use_sorted_ctc_refiner=False,
+        sorted_ctc_refiner_layers=1,
+        sorted_ctc_refiner_kernel=3,
+        sorted_ctc_refiner_dropout=0.0,
+        sorted_ctc_refiner_axis=1,
     ):
         """Initializes the model.
         Parameters:
@@ -215,6 +433,15 @@ class DINO(nn.Module):
         self.glyph_proto_dim = int(glyph_proto_dim)
         self.glyph_proto_temperature = float(glyph_proto_temperature)
         self.glyph_proto_trainable = bool(glyph_proto_trainable)
+        self.use_query_sequence_refiner = bool(use_query_sequence_refiner)
+        self.query_sequence_refiner_layers = int(query_sequence_refiner_layers)
+        self.query_sequence_refiner_kernel = int(query_sequence_refiner_kernel)
+        self.query_sequence_refiner_dropout = float(query_sequence_refiner_dropout)
+        self.use_sorted_ctc_refiner = bool(use_sorted_ctc_refiner)
+        self.sorted_ctc_refiner_layers = int(sorted_ctc_refiner_layers)
+        self.sorted_ctc_refiner_kernel = int(sorted_ctc_refiner_kernel)
+        self.sorted_ctc_refiner_dropout = float(sorted_ctc_refiner_dropout)
+        self.sorted_ctc_refiner_axis = int(sorted_ctc_refiner_axis)
 
         # setting query dim
         self.query_dim = query_dim
@@ -363,6 +590,24 @@ class DINO(nn.Module):
             torch.set_rng_state(torch_rng_state)
             if not self.glyph_proto_trainable:
                 self.glyph_prototype_table.weight.requires_grad_(False)
+        if self.use_query_sequence_refiner:
+            torch_rng_state = torch.get_rng_state()
+            self.query_sequence_refiner = QuerySequenceRefiner(
+                hidden_dim,
+                num_layers=self.query_sequence_refiner_layers,
+                kernel_size=self.query_sequence_refiner_kernel,
+                dropout=self.query_sequence_refiner_dropout,
+            )
+            torch.set_rng_state(torch_rng_state)
+        if self.use_sorted_ctc_refiner:
+            torch_rng_state = torch.get_rng_state()
+            self.sorted_ctc_refiner = QuerySequenceRefiner(
+                hidden_dim,
+                num_layers=self.sorted_ctc_refiner_layers,
+                kernel_size=self.sorted_ctc_refiner_kernel,
+                dropout=self.sorted_ctc_refiner_dropout,
+            )
+            torch.set_rng_state(torch_rng_state)
 
     def _reset_parameters(self):
         # init input_proj
@@ -482,12 +727,16 @@ class DINO(nn.Module):
             outputs_coord_list.append(layer_outputs_unsig)
         outputs_coord_list = torch.stack(outputs_coord_list)
 
-        outputs_class = torch.stack(
-            [
-                layer_cls_embed(layer_hs)
-                for layer_cls_embed, layer_hs in zip(self.class_embed, hs)
-            ]
-        )
+        final_query_hs = hs[-1]
+        if self.use_query_sequence_refiner:
+            final_query_hs = self.query_sequence_refiner(final_query_hs)
+
+        outputs_class_list = []
+        for dec_lid, (layer_cls_embed, layer_hs) in enumerate(zip(self.class_embed, hs)):
+            if dec_lid == len(hs) - 1:
+                layer_hs = final_query_hs
+            outputs_class_list.append(layer_cls_embed(layer_hs))
+        outputs_class = torch.stack(outputs_class_list)
         if self.dn_number > 0 and dn_meta is not None:
             outputs_class, outputs_coord_list = dn_post_process(
                 outputs_class,
@@ -497,10 +746,28 @@ class DINO(nn.Module):
                 self._set_aux_loss,
             )
         out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord_list[-1]}
+        if (
+            self.use_sorted_ctc_refiner
+            and dn_meta is None
+            and hs[-1].shape[:2] == outputs_coord_list[-1].shape[:2]
+        ):
+            sort_axis = 1 if self.sorted_ctc_refiner_axis == 1 else 0
+            _, sorted_idx = torch.sort(
+                outputs_coord_list[-1][:, :, sort_axis],
+                dim=1,
+                descending=False,
+            )
+            sorted_query_hs = torch.gather(
+                hs[-1],
+                1,
+                sorted_idx.unsqueeze(-1).expand(-1, -1, hs[-1].shape[-1]),
+            )
+            refined_sorted_query_hs = self.sorted_ctc_refiner(sorted_query_hs)
+            out["pred_sorted_ctc_logits"] = self.class_embed[-1](refined_sorted_query_hs)
         if self.use_query_activation_head:
-            out["pred_activation_logits"] = self.query_activation_embed(hs[-1])
+            out["pred_activation_logits"] = self.query_activation_embed(final_query_hs)
         if self.use_glyph_prototype_head:
-            proto_query = F.normalize(self.glyph_proto_proj(hs[-1]), dim=-1)
+            proto_query = F.normalize(self.glyph_proto_proj(final_query_hs), dim=-1)
             proto_table = self.glyph_prototype_table.weight
             current_num_classes = outputs_class[-1].shape[-1]
             if proto_table.shape[0] != current_num_classes:
@@ -515,7 +782,7 @@ class DINO(nn.Module):
             proto_logits = proto_logits / max(self.glyph_proto_temperature, 1e-6)
             out["pred_proto_logits"] = proto_logits
         if self.use_direction_head:
-            out["pred_direction"] = self.direction_embed(hs[-1].mean(dim=1))
+            out["pred_direction"] = self.direction_embed(final_query_hs.mean(dim=1))
         if self.aux_loss:
             out["aux_outputs"] = self._set_aux_loss(outputs_class, outputs_coord_list)
 
@@ -606,11 +873,17 @@ class SetCriterion(nn.Module):
         use_activation_gating=False,
         use_glyph_prototype_head=False,
         glyph_proto_fuse_coef=0.0,
+        glyph_proto_aux_max_len=0,
+        glyph_proto_aux_gamma=0.0,
         activation_gate_blank_coef=0.0,
         activation_gate_nonblank_coef=0.0,
         query_count_short_weight=1.0,
         query_budget_scale=2.0,
         query_budget_margin=8.0,
+        use_sorted_ctc_refiner=False,
+        ctc_viterbi_loss_blank_weight=0.0,
+        ctc_viterbi_loss_nonblank_weight=1.0,
+        ctc_viterbi_loss_max_len=0,
     ):
         """Create the criterion.
         Parameters:
@@ -638,13 +911,21 @@ class SetCriterion(nn.Module):
         self.use_activation_gating = bool(use_activation_gating)
         self.use_glyph_prototype_head = bool(use_glyph_prototype_head)
         self.glyph_proto_fuse_coef = float(glyph_proto_fuse_coef)
+        self.glyph_proto_aux_max_len = int(glyph_proto_aux_max_len)
+        self.glyph_proto_aux_gamma = float(glyph_proto_aux_gamma)
         self.activation_gate_blank_coef = float(activation_gate_blank_coef)
         self.activation_gate_nonblank_coef = float(activation_gate_nonblank_coef)
         self.query_count_short_weight = float(query_count_short_weight)
         self.query_budget_scale = float(query_budget_scale)
         self.query_budget_margin = float(query_budget_margin)
+        self.use_sorted_ctc_refiner = bool(use_sorted_ctc_refiner)
+        self.ctc_viterbi_loss_blank_weight = float(ctc_viterbi_loss_blank_weight)
+        self.ctc_viterbi_loss_nonblank_weight = float(ctc_viterbi_loss_nonblank_weight)
+        self.ctc_viterbi_loss_max_len = int(ctc_viterbi_loss_max_len)
         self.direction_loss_enabled = "loss_direction" in self.weight_dict
         self.ctc_count_loss_enabled = "loss_ctc_count" in self.weight_dict
+        self.ctc_viterbi_loss_enabled = "loss_ctc_viterbi" in self.weight_dict
+        self.glyph_proto_aux_enabled = "loss_glyph_proto_aux" in self.weight_dict
         self.short_gt_presence_enabled = "loss_short_gt_presence" in self.weight_dict
         self.short_gt_ce_enabled = "loss_short_gt_ce" in self.weight_dict
         self.query_budget_loss_enabled = "loss_query_budget" in self.weight_dict
@@ -732,11 +1013,14 @@ class SetCriterion(nn.Module):
             idx_list.append(idx_i)
         idx = torch.stack(idx_list, dim=0)
 
-        sorted_by_x_pred_logits = torch.gather(
-            pred_logits_topk,
-            1,
-            idx.unsqueeze(-1).expand(-1, -1, pred_logits_topk.shape[-1]),
-        )
+        if self.use_sorted_ctc_refiner and "pred_sorted_ctc_logits" in outputs:
+            sorted_by_x_pred_logits = outputs["pred_sorted_ctc_logits"]
+        else:
+            sorted_by_x_pred_logits = torch.gather(
+                pred_logits_topk,
+                1,
+                idx.unsqueeze(-1).expand(-1, -1, pred_logits_topk.shape[-1]),
+            )
         sorted_by_x_pred_logits = sorted_by_x_pred_logits.sigmoid()
 
         new_pred_logits = torch.zeros(
@@ -827,8 +1111,9 @@ class SetCriterion(nn.Module):
             for i, target in enumerate(targets):
                 targets_tensor[i, : len(target["labels"])] = target["labels"] + 1
         ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True, reduction="mean")
+        pred_log_probs = torch.log(pred_logits_padded.permute(1, 0, 2))
         loss = ctc_loss(
-            torch.log(pred_logits_padded.permute(1, 0, 2)),
+            pred_log_probs,
             targets_tensor,
             length_pred,
             length_input,
@@ -864,6 +1149,23 @@ class SetCriterion(nn.Module):
             losses["loss_ctc_count"] = count_loss.mean()
             losses["ctc_expected_count"] = expected_nonblank_count.detach().mean()
             losses["ctc_target_count"] = target_count.detach().mean()
+
+        if self.ctc_viterbi_loss_enabled:
+            unpadded_log_probs = torch.log(new_pred_logits.permute(1, 0, 2))
+            viterbi_loss, viterbi_stats = compute_ctc_viterbi_alignment_loss(
+                unpadded_log_probs,
+                targets_tensor.to(device),
+                length_input.to(device),
+                blank=0,
+                blank_weight=self.ctc_viterbi_loss_blank_weight,
+                nonblank_weight=self.ctc_viterbi_loss_nonblank_weight,
+                max_target_len=self.ctc_viterbi_loss_max_len,
+            )
+            losses["loss_ctc_viterbi"] = viterbi_loss
+            losses["ctc_viterbi_selected_samples"] = torch.tensor(
+                float(viterbi_stats["selected_samples"]),
+                device=device,
+            )
 
         if self.short_gt_presence_enabled:
             presence_losses = []
@@ -905,6 +1207,36 @@ class SetCriterion(nn.Module):
                 float(short_gt_ce_stats["selected_chars"]),
                 device=device,
             )
+
+        if self.glyph_proto_aux_enabled:
+            pred_proto_logits = outputs.get("pred_proto_logits")
+            if pred_proto_logits is None:
+                losses["loss_glyph_proto_aux"] = loss * 0.0
+                losses["glyph_proto_aux_selected_chars"] = torch.tensor(0.0, device=device)
+                losses["glyph_proto_aux_eligible_samples"] = torch.tensor(0.0, device=device)
+            else:
+                sorted_proto_logits = torch.gather(
+                    pred_proto_logits,
+                    1,
+                    idx.unsqueeze(-1).expand(-1, -1, pred_proto_logits.shape[-1]),
+                )
+                char_probs = new_pred_logits[:, :, 1:].clamp(min=1e-8)
+                proto_aux_loss, proto_aux_stats = compute_glyph_proto_aux_loss(
+                    sorted_proto_logits,
+                    char_probs,
+                    targets,
+                    max_len=self.glyph_proto_aux_max_len,
+                    gamma=self.glyph_proto_aux_gamma,
+                )
+                losses["loss_glyph_proto_aux"] = proto_aux_loss
+                losses["glyph_proto_aux_eligible_samples"] = torch.tensor(
+                    float(proto_aux_stats["eligible_samples"]),
+                    device=device,
+                )
+                losses["glyph_proto_aux_selected_chars"] = torch.tensor(
+                    float(proto_aux_stats["selected_chars"]),
+                    device=device,
+                )
 
         if self.direction_loss_enabled:
             losses.update(self.loss_direction(outputs, targets, indices, num_boxes))
@@ -1503,6 +1835,15 @@ def build_dino(args):
         glyph_proto_dim=getattr(args, "glyph_proto_dim", 256),
         glyph_proto_temperature=getattr(args, "glyph_proto_temperature", 1.0),
         glyph_proto_trainable=getattr(args, "glyph_proto_trainable", True),
+        use_query_sequence_refiner=getattr(args, "use_query_sequence_refiner", False),
+        query_sequence_refiner_layers=getattr(args, "query_sequence_refiner_layers", 1),
+        query_sequence_refiner_kernel=getattr(args, "query_sequence_refiner_kernel", 3),
+        query_sequence_refiner_dropout=getattr(args, "query_sequence_refiner_dropout", 0.0),
+        use_sorted_ctc_refiner=getattr(args, "use_sorted_ctc_refiner", False),
+        sorted_ctc_refiner_layers=getattr(args, "sorted_ctc_refiner_layers", 1),
+        sorted_ctc_refiner_kernel=getattr(args, "sorted_ctc_refiner_kernel", 3),
+        sorted_ctc_refiner_dropout=getattr(args, "sorted_ctc_refiner_dropout", 0.0),
+        sorted_ctc_refiner_axis=getattr(args, "sorted_ctc_refiner_axis", 1),
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))
@@ -1562,12 +1903,18 @@ def build_dino(args):
     ctc_count_loss_coef = getattr(args, "ctc_count_loss_coef", 0.0)
     if ctc_count_loss_coef > 0:
         weight_dict["loss_ctc_count"] = ctc_count_loss_coef
+    ctc_viterbi_loss_coef = getattr(args, "ctc_viterbi_loss_coef", 0.0)
+    if ctc_viterbi_loss_coef > 0:
+        weight_dict["loss_ctc_viterbi"] = ctc_viterbi_loss_coef
     short_gt_presence_loss_coef = getattr(args, "short_gt_presence_loss_coef", 0.0)
     if short_gt_presence_loss_coef > 0:
         weight_dict["loss_short_gt_presence"] = short_gt_presence_loss_coef
     short_gt_ce_loss_coef = getattr(args, "short_gt_ce_loss_coef", 0.0)
     if short_gt_ce_loss_coef > 0:
         weight_dict["loss_short_gt_ce"] = short_gt_ce_loss_coef
+    glyph_proto_aux_loss_coef = getattr(args, "glyph_proto_aux_loss_coef", 0.0)
+    if glyph_proto_aux_loss_coef > 0:
+        weight_dict["loss_glyph_proto_aux"] = glyph_proto_aux_loss_coef
     query_count_loss_coef = getattr(args, "query_count_loss_coef", 0.0)
     if getattr(args, "use_query_count_loss", False) and query_count_loss_coef > 0:
         weight_dict["loss_query_count"] = query_count_loss_coef
@@ -1601,11 +1948,17 @@ def build_dino(args):
         use_activation_gating=getattr(args, "use_activation_gating", False),
         use_glyph_prototype_head=getattr(args, "use_glyph_prototype_head", False),
         glyph_proto_fuse_coef=getattr(args, "glyph_proto_fuse_coef", 0.0),
+        glyph_proto_aux_max_len=getattr(args, "glyph_proto_aux_max_len", 0),
+        glyph_proto_aux_gamma=getattr(args, "glyph_proto_aux_gamma", 0.0),
         activation_gate_blank_coef=getattr(args, "activation_gate_blank_coef", 0.0),
         activation_gate_nonblank_coef=getattr(args, "activation_gate_nonblank_coef", 0.0),
         query_count_short_weight=getattr(args, "query_count_short_weight", 1.0),
         query_budget_scale=getattr(args, "query_budget_scale", 2.0),
         query_budget_margin=getattr(args, "query_budget_margin", 8.0),
+        use_sorted_ctc_refiner=getattr(args, "use_sorted_ctc_refiner", False),
+        ctc_viterbi_loss_blank_weight=getattr(args, "ctc_viterbi_loss_blank_weight", 0.0),
+        ctc_viterbi_loss_nonblank_weight=getattr(args, "ctc_viterbi_loss_nonblank_weight", 1.0),
+        ctc_viterbi_loss_max_len=getattr(args, "ctc_viterbi_loss_max_len", 0),
     )
     criterion.to(device)
     postprocessors = {
